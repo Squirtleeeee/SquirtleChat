@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+frontend/dist/
+
+# Go
+backend/data/
+
+# Env
+.env
+.env.*
+!.env.example
+deploy/llm.env
+
+# Runtime logs (background start)
+logs/
+
+# IDE / agent
+.idea/
+.vscode/
+.cursor/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

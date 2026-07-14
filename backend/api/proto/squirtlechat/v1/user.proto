@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package squirtlechat.v1;
+
+import "squirtlechat/v1/common.proto";
+
+option go_package = "squirtlechat/api/gen/squirtlechat/v1;squirtlechatv1";
+
+service UserService {
+  rpc GetProfile(GetProfileRequest) returns (User);
+  rpc UpdateProfile(UpdateProfileRequest) returns (User);
+  rpc SearchUsers(SearchUsersRequest) returns (SearchUsersResponse);
+}
+
+message GetProfileRequest {
+  int64 user_id = 1;
+}
+
+message UpdateProfileRequest {
+  int64 user_id = 1;
+  string nickname = 2;
+  string avatar = 3;
+}
+
+message SearchUsersRequest {
+  string query = 1;
+  int32 limit = 2;
+}
+
+message SearchUsersResponse {
+  repeated User users = 1;
+}

@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package squirtlechat.v1;
+
+option go_package = "squirtlechat/api/gen/squirtlechat/v1;squirtlechatv1";
+
+message User {
+  int64 id = 1;
+  string username = 2;
+  string nickname = 3;
+  string avatar = 4;
+}
+
+message TokenPair {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 expires_in = 3;
+}
+
+message Empty {}

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package squirtlechat.v1;
+
+option go_package = "squirtlechat/api/gen/squirtlechat/v1;squirtlechatv1";
+
+service FileService {
+  rpc Upload(UploadRequest) returns (UploadResponse);
+}
+
+message UploadRequest {
+  int64 uploader_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  bytes data = 4;
+}
+
+message UploadResponse {
+  int64 file_id = 1;
+  string url = 2;
+  string filename = 3;
+  int64 size = 4;
+  string content_type = 5;
+}

@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package squirtlechat.v1;
+
+import "squirtlechat/v1/common.proto";
+
+option go_package = "squirtlechat/api/gen/squirtlechat/v1;squirtlechatv1";
+
+service FriendService {
+  rpc RequestFriend(FriendRequestMsg) returns (Empty);
+  rpc AcceptFriend(AcceptFriendRequest) returns (Empty);
+  rpc RejectFriend(RejectFriendRequest) returns (Empty);
+  rpc ListFriends(ListFriendsRequest) returns (ListFriendsResponse);
+  rpc DeleteFriend(DeleteFriendRequest) returns (Empty);
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+}
+
+message FriendRequestMsg {
+  int64 from_user_id = 1;
+  int64 to_user_id = 2;
+  string message = 3;
+}
+
+message AcceptFriendRequest {
+  int64 request_id = 1;
+  int64 user_id = 2;
+}
+
+message RejectFriendRequest {
+  int64 request_id = 1;
+  int64 user_id = 2;
+}
+
+message ListFriendsRequest {
+  int64 user_id = 1;
+}
+
+message ListFriendsResponse {
+  repeated int64 friend_ids = 1;
+}
+
+message DeleteFriendRequest {
+  int64 user_id = 1;
+  int64 friend_id = 2;
+}
+
+message CreateGroupRequest {
+  int64 owner_id = 1;
+  string name = 2;
+  repeated int64 member_ids = 3;
+}
+
+message CreateGroupResponse {
+  string conversation_id = 1;
+  int64 group_id = 2;
+}
+
+message ListGroupsRequest {
+  int64 user_id = 1;
+}
+
+message GroupSummary {
+  int64 id = 1;
+  string name = 2;
+  int64 owner_id = 3;
+  string conversation_id = 4;
+}
+
+message ListGroupsResponse {
+  repeated GroupSummary groups = 1;
+}
