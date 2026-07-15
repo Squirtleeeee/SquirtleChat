@@ -37,7 +37,25 @@ export function previewMessage(content: string, msgType = 1): string {
   if (msgType === 4 || content === '[已撤回]') return '[已撤回]'
   if (msgType === 2) return '[图片]'
   if (msgType === 3) return '[文件]'
-  if (content.startsWith('{') && content.includes('"url"')) return '[文件]'
+  if (msgType === 5) return '[语音]'
+  if (msgType === 6) {
+    try {
+      const o = JSON.parse(content) as { question?: string }
+      if (o?.question) return `[投票] ${o.question}`
+    } catch {
+      /* ignore */
+    }
+    return '[投票]'
+  }
+  if (content.startsWith('{') && content.includes('"url"')) {
+    try {
+      const j = JSON.parse(content) as { duration?: number }
+      if (typeof j.duration === 'number') return '[语音]'
+    } catch {
+      /* fallthrough */
+    }
+    return '[文件]'
+  }
   let t = content.trim()
   if (t.startsWith('⟦sq-reply⟧')) {
     const end = t.indexOf('⟦/sq-reply⟧')

@@ -13,10 +13,15 @@ func TestSearchUsersEmptyQuery(t *testing.T) {
 	}
 }
 
-func TestUpdateProfileEmptyNickname(t *testing.T) {
+func TestChangePasswordValidation(t *testing.T) {
 	s := &AuthService{}
-	_, err := s.UpdateProfile(context.Background(), 1, "", "")
-	if err == nil {
-		t.Fatal("expected error for empty nickname")
+	if err := s.ChangePassword(context.Background(), 1, "", "abcdef"); err == nil {
+		t.Fatal("expected error for empty old password")
+	}
+	if err := s.ChangePassword(context.Background(), 1, "oldpass", "123"); err == nil {
+		t.Fatal("expected error for short new password")
+	}
+	if err := s.ChangePassword(context.Background(), 1, "same", "same"); err == nil {
+		t.Fatal("expected error when passwords match")
 	}
 }

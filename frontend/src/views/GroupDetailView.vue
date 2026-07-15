@@ -24,6 +24,22 @@ const notice = ref('')
 const noticeDraft = ref('')
 const editingNotice = ref(false)
 const savingNotice = ref(false)
+const welcomeText = ref('')
+const welcomeDraft = ref('')
+const editingWelcome = ref(false)
+const savingWelcome = ref(false)
+const adminOnly = ref(false)
+const togglingAdminOnly = ref(false)
+const slowModeSecs = ref(0)
+const savingSlowMode = ref(false)
+const memberMuted = ref<Record<string, boolean>>({})
+const memberNicknames = ref<Record<string, string>>({})
+const memberRemarks = ref<Record<string, string>>({})
+const remarkTarget = ref<PublicProfile | null>(null)
+const remarkDraft = ref('')
+const savingRemark = ref(false)
+const myNicknameDraft = ref('')
+const savingNickname = ref(false)
 const showInvite = ref(false)
 const inviteSelected = ref<string[]>([])
 const inviting = ref(false)
@@ -41,6 +57,20 @@ const pendingInvites = ref<
 const showTransfer = ref(false)
 const transferTarget = ref('')
 const leaving = ref(false)
+const inviteLinks = ref<
+  {
+    id: string
+    code: string
+    max_uses: number
+    use_count: number
+    expires_at?: string
+    expired?: boolean
+  }[]
+>([])
+const creatingLink = ref(false)
+const linkMaxUses = ref(0)
+const linkExpiresHours = ref(72)
+const copiedLinkId = ref('')
 
 const groupId = () => idStr(String(route.params.id || ''))
 const isOwner = computed(() => sameId(ownerId.value, auth.user?.id))
@@ -69,6 +99,10 @@ const sortedMembers = computed(() => {
 })
 
 function memberLabel(m: PublicProfile) {
+  const remark = memberRemarks.value[idStr(m.id)]?.trim()
+  if (remark) return remark
+  const gn = memberNicknames.value[idStr(m.id)]?.trim()
+  if (gn) return gn
   const friend = chat.friends.find((f) => sameId(f.id, m.id))
   if (friend) return friendDisplayName(friend)
   return m.nickname || m.username
@@ -83,15 +117,115 @@ onMounted(async () => {
     conversationId.value = g.conversation_id
     notice.value = g.notice || ''
     noticeDraft.value = notice.value
+    welcomeText.value = g.welcome_text || ''
+    welcomeDraft.value = welcomeText.value
+    adminOnly.value = !!g.admin_only
+    slowModeSecs.value = g.slow_mode_secs || 0
     members.value = (g.members || []).map((m) => ({ ...m, id: idStr(m.id) }))
     memberRoles.value = g.member_roles || {}
+    memberMuted.value = g.member_muted || {}
+    memberNicknames.value = g.member_nicknames || {}
+    memberRemarks.value = g.member_remarks || {}
+    myNicknameDraft.value = memberNicknames.value[idStr(auth.user?.id)] || ''
     await loadPendingInvites()
+    if (isManager.value) await loadInviteLinks()
   } catch (e) {
     chat.setError(parseError(e))
   } finally {
     loading.value = false
   }
 })
+
+async function loadInviteLinks() {
+  try {
+    inviteLinks.value = await chat.listGroupInviteLinks(groupId())
+  } catch {
+    inviteLinks.value = []
+  }
+}
+
+async function createInviteLink() {
+  creatingLink.value = true
+  try {
+    await chat.createGroupInviteLink(groupId(), {
+      max_uses: Number(linkMaxUses.value) || 0,
+      expires_hours: Number(linkExpiresHours.value) || 0,
+    })
+    await loadInviteLinks()
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    creatingLink.value = false
+  }
+}
+
+async function revokeInviteLink(id: string) {
+  if (!confirm('确定撤销该邀请链接？')) return
+  try {
+    await chat.revokeGroupInviteLink(groupId(), id)
+    await loadInviteLinks()
+  } catch (e) {
+    chat.setError(parseError(e))
+  }
+}
+
+async function copyInviteCode(code: string, id: string) {
+  try {
+    await navigator.clipboard.writeText(code)
+    copiedLinkId.value = id
+    chat.setTransientNotice('邀请码已复制')
+    setTimeout(() => {
+      if (copiedLinkId.value === id) copiedLinkId.value = ''
+    }, 2000)
+  } catch {
+    chat.setError('复制失败')
+  }
+}
+
+async function saveMyNickname() {
+  savingNickname.value = true
+  try {
+    await chat.setMyGroupNickname(groupId(), myNicknameDraft.value)
+    const uid = idStr(auth.user?.id)
+    const nick = myNicknameDraft.value.trim()
+    if (nick) memberNicknames.value = { ...memberNicknames.value, [uid]: nick }
+    else {
+      const next = { ...memberNicknames.value }
+      delete next[uid]
+      memberNicknames.value = next
+    }
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    savingNickname.value = false
+  }
+}
+
+function startRemark(m: PublicProfile) {
+  remarkTarget.value = m
+  remarkDraft.value = memberRemarks.value[idStr(m.id)] || ''
+}
+
+async function saveRemark() {
+  if (!remarkTarget.value) return
+  savingRemark.value = true
+  try {
+    const uid = idStr(remarkTarget.value.id)
+    await chat.setGroupMemberRemark(groupId(), uid, remarkDraft.value)
+    const r = remarkDraft.value.trim()
+    if (r) memberRemarks.value = { ...memberRemarks.value, [uid]: r }
+    else {
+      const next = { ...memberRemarks.value }
+      delete next[uid]
+      memberRemarks.value = next
+    }
+    remarkTarget.value = null
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    savingRemark.value = false
+  }
+}
 
 function startEditNotice() {
   noticeDraft.value = notice.value
@@ -108,6 +242,19 @@ async function saveNotice() {
     chat.setError(parseError(e))
   } finally {
     savingNotice.value = false
+  }
+}
+
+async function saveWelcome() {
+  savingWelcome.value = true
+  try {
+    await chat.setGroupWelcome(groupId(), welcomeDraft.value)
+    welcomeText.value = welcomeDraft.value.trim()
+    editingWelcome.value = false
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    savingWelcome.value = false
   }
 }
 
@@ -184,6 +331,60 @@ function canKick(m: PublicProfile) {
   if (isOwner.value) return !sameId(m.id, auth.user?.id)
   if (isManager.value && !isAdmin(m)) return true
   return false
+}
+
+function canMute(m: PublicProfile) {
+  if (!isManager.value) return false
+  if (sameId(m.id, auth.user?.id)) return false
+  if (sameId(m.id, ownerId.value)) return false
+  if (isAdmin(m) && !isOwner.value) return false
+  return true
+}
+
+function isMuted(m: PublicProfile) {
+  return !!memberMuted.value[idStr(m.id)]
+}
+
+async function toggleMute(m: PublicProfile) {
+  if (!canMute(m)) return
+  try {
+    const next = !isMuted(m)
+    await chat.setGroupMemberMuted(groupId(), m.id, next)
+    const map = { ...memberMuted.value }
+    if (next) map[idStr(m.id)] = true
+    else delete map[idStr(m.id)]
+    memberMuted.value = map
+  } catch (e) {
+    chat.setError(parseError(e))
+  }
+}
+
+async function toggleAdminOnly() {
+  if (!isManager.value || togglingAdminOnly.value) return
+  togglingAdminOnly.value = true
+  try {
+    const next = !adminOnly.value
+    await chat.setGroupAdminOnly(groupId(), next)
+    adminOnly.value = next
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    togglingAdminOnly.value = false
+  }
+}
+
+async function saveSlowMode() {
+  if (!isManager.value || savingSlowMode.value) return
+  savingSlowMode.value = true
+  try {
+    const secs = Math.max(0, Math.min(3600, Number(slowModeSecs.value) || 0))
+    await chat.setGroupSlowMode(groupId(), secs)
+    slowModeSecs.value = secs
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    savingSlowMode.value = false
+  }
 }
 
 async function loadPendingInvites() {
@@ -347,6 +548,117 @@ async function leaveGroup() {
         <p v-else class="notice-body">{{ notice || '暂无公告' }}</p>
       </section>
 
+      <section v-if="isManager" class="notice-section">
+        <div class="notice-head">
+          <h3>入群欢迎语</h3>
+          <button
+            v-if="!editingWelcome"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            @click="editingWelcome = true; welcomeDraft = welcomeText"
+          >
+            {{ welcomeText ? '编辑' : '设置' }}
+          </button>
+        </div>
+        <div v-if="editingWelcome" class="notice-edit">
+          <textarea
+            v-model="welcomeDraft"
+            class="notice-input"
+            rows="2"
+            maxlength="200"
+            placeholder="新成员入群后自动发送（最多 200 字）"
+          />
+          <div class="notice-actions">
+            <button type="button" class="btn btn-secondary btn-sm" @click="editingWelcome = false">取消</button>
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              :disabled="savingWelcome"
+              @click="saveWelcome"
+            >
+              {{ savingWelcome ? '保存中…' : '保存' }}
+            </button>
+          </div>
+        </div>
+        <p v-else class="notice-body">{{ welcomeText || '未设置（仍会提示「xxx 加入了群聊」）' }}</p>
+      </section>
+
+      <section class="nickname-section">
+        <h3>我的群名片</h3>
+        <p class="nickname-hint">仅在本群显示；留空则使用个人昵称。</p>
+        <div class="nickname-edit">
+          <input
+            v-model="myNicknameDraft"
+            class="nickname-input"
+            type="text"
+            maxlength="32"
+            placeholder="输入群内昵称"
+          />
+          <button type="button" class="btn btn-primary btn-sm" :disabled="savingNickname" @click="saveMyNickname">
+            {{ savingNickname ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </section>
+
+      <section v-if="isManager" class="mute-section">
+        <h3>发言管理</h3>
+        <label class="mute-toggle">
+          <input
+            type="checkbox"
+            :checked="adminOnly"
+            :disabled="togglingAdminOnly"
+            @change="toggleAdminOnly"
+          />
+          <span>全员禁言（仅管理员/群主可发言）</span>
+        </label>
+        <p class="mute-hint">也可在成员列表对个人禁言。</p>
+        <div class="slow-mode-row">
+          <label class="invite-link-field">
+            <span>慢速模式（秒）</span>
+            <input v-model.number="slowModeSecs" class="nickname-input" type="number" min="0" max="3600" />
+          </label>
+          <button type="button" class="btn btn-primary btn-sm" :disabled="savingSlowMode" @click="saveSlowMode">
+            {{ savingSlowMode ? '保存中…' : '保存' }}
+          </button>
+        </div>
+        <p class="mute-hint">普通成员两次发言最小间隔；0 为关闭。管理员不受限。</p>
+      </section>
+
+      <section v-if="isManager" class="invite-link-section">
+        <h3>邀请链接</h3>
+        <p class="nickname-hint">分享邀请码，对方可直接入群；可限次、设过期并随时撤销。</p>
+        <div class="invite-link-form">
+          <label class="invite-link-field">
+            <span>次数上限</span>
+            <input v-model.number="linkMaxUses" class="nickname-input" type="number" min="0" max="10000" />
+          </label>
+          <label class="invite-link-field">
+            <span>有效小时</span>
+            <input v-model.number="linkExpiresHours" class="nickname-input" type="number" min="0" max="2160" />
+          </label>
+          <button type="button" class="btn btn-primary btn-sm" :disabled="creatingLink" @click="createInviteLink">
+            {{ creatingLink ? '创建中…' : '生成链接' }}
+          </button>
+        </div>
+        <p class="mute-hint">次数/小时填 0 表示不限制。</p>
+        <ul v-if="inviteLinks.length" class="invite-link-list">
+          <li v-for="link in inviteLinks" :key="link.id" class="invite-link-row">
+            <div class="invite-link-meta">
+              <code class="invite-code">{{ link.code }}</code>
+              <span class="member-sub">
+                已用 {{ link.use_count }}{{ link.max_uses ? ` / ${link.max_uses}` : '' }}
+                <template v-if="link.expires_at"> · 至 {{ link.expires_at.slice(0, 16).replace('T', ' ') }}</template>
+                <template v-if="link.expired"> · 已失效</template>
+              </span>
+            </div>
+            <button type="button" class="btn btn-ghost btn-sm" @click="copyInviteCode(link.code, link.id)">
+              {{ copiedLinkId === link.id ? '已复制' : '复制' }}
+            </button>
+            <button type="button" class="btn btn-ghost btn-sm" @click="revokeInviteLink(link.id)">撤销</button>
+          </li>
+        </ul>
+      </section>
+
       <section class="members">
         <h3>群成员（{{ members.length }}）</h3>
         <ul>
@@ -361,6 +673,15 @@ async function leaveGroup() {
             </div>
             <span v-if="sameId(m.id, ownerId)" class="tag">群主</span>
             <span v-else-if="isAdmin(m)" class="tag admin">管理员</span>
+            <span v-if="isMuted(m)" class="tag muted">禁言</span>
+            <button
+              v-if="!sameId(m.id, auth.user?.id)"
+              type="button"
+              class="btn btn-ghost btn-sm"
+              @click.stop="startRemark(m)"
+            >
+              备注
+            </button>
             <button
               v-if="isOwner && !sameId(m.id, ownerId) && !sameId(m.id, auth.user?.id)"
               type="button"
@@ -368,6 +689,14 @@ async function leaveGroup() {
               @click.stop="toggleAdmin(m)"
             >
               {{ isAdmin(m) ? '取消管理' : '设管理员' }}
+            </button>
+            <button
+              v-if="canMute(m)"
+              type="button"
+              class="btn btn-ghost btn-sm mute-btn"
+              @click.stop="toggleMute(m)"
+            >
+              {{ isMuted(m) ? '解禁' : '禁言' }}
             </button>
             <button
               v-if="canKick(m)"
@@ -408,6 +737,20 @@ async function leaveGroup() {
         {{ leaving ? '退出中…' : '退出群聊' }}
       </button>
       <p v-else class="owner-leave-hint">群主需先转让群主后才能退出</p>
+    </div>
+
+    <div v-if="remarkTarget" class="remark-overlay" @click.self="remarkTarget = null">
+      <div class="remark-dialog" role="dialog" aria-label="设置群成员备注">
+        <h3>备注 {{ memberLabel(remarkTarget) }}</h3>
+        <p class="nickname-hint">仅你可见，不影响对方在群内的显示名。</p>
+        <input v-model="remarkDraft" class="nickname-input" type="text" maxlength="32" placeholder="输入备注" />
+        <div class="remark-actions">
+          <button type="button" class="btn btn-secondary btn-sm" @click="remarkTarget = null">取消</button>
+          <button type="button" class="btn btn-primary btn-sm" :disabled="savingRemark" @click="saveRemark">
+            {{ savingRemark ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -507,6 +850,146 @@ async function leaveGroup() {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--color-text-muted);
+}
+
+.nickname-section {
+  margin-top: var(--space-6);
+  padding: var(--space-4);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.nickname-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.nickname-hint {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.nickname-edit {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.nickname-input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-size: var(--text-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-chat);
+}
+
+.mute-section {
+  margin-top: var(--space-6);
+  padding: var(--space-4);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.mute-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.mute-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.mute-hint {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.slow-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: flex-end;
+  margin-top: var(--space-3);
+}
+
+.tag.muted {
+  background: var(--color-danger-muted, #fde8e8);
+  color: var(--color-danger, #c62828);
+}
+
+.mute-btn {
+  flex-shrink: 0;
+}
+
+.invite-link-section {
+  margin-top: var(--space-6);
+  padding: var(--space-4);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.invite-link-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.invite-link-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: flex-end;
+}
+
+.invite-link-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  min-width: 96px;
+}
+
+.invite-link-list {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.invite-link-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.invite-link-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.invite-code {
+  font-size: var(--text-sm);
+  letter-spacing: 0.04em;
 }
 
 .notice-section {
@@ -724,5 +1207,36 @@ async function leaveGroup() {
   background: var(--color-primary-muted);
   padding: 2px 8px;
   border-radius: var(--radius-full);
+}
+
+.remark-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  padding: var(--space-4);
+}
+
+.remark-dialog {
+  width: min(360px, 100%);
+  padding: var(--space-4);
+  background: var(--color-bg-surface);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+}
+
+.remark-dialog h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-base);
+}
+
+.remark-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 </style>

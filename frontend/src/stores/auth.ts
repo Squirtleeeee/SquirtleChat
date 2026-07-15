@@ -15,6 +15,8 @@ export type User = {
   username: string
   nickname: string
   avatar?: string
+  status_text?: string
+  status_emoji?: string
   gender?: number
   birthday?: string
   privacy?: UserPrivacy
@@ -25,12 +27,21 @@ export type PublicProfile = {
   username: string
   nickname?: string
   avatar?: string
+  status_text?: string
+  status_emoji?: string
   gender?: number
   birthday?: string
   remark?: string
 }
 
 type LoginResult = { user: User; tokens: { access_token: string; refresh_token: string } }
+
+export type DeviceSession = {
+  device_id: string
+  device_name: string
+  last_active_at: string
+  current: boolean
+}
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -62,6 +73,8 @@ export const useAuthStore = defineStore('auth', {
         username: u.username,
         nickname: u.nickname,
         avatar: u.avatar,
+        status_text: u.status_text,
+        status_emoji: u.status_emoji,
         gender: u.gender,
         birthday: u.birthday,
       }
@@ -71,12 +84,21 @@ export const useAuthStore = defineStore('auth', {
       this.applyLogin(unwrapApiData<LoginResult>(data))
     },
     async login(username: string, password: string) {
+      const deviceName = window.squirtleDesktop?.isElectron ? 'SquirtleChat Desktop' : 'SquirtleChat Web'
       const { data } = await http.post('/auth/login', {
         username,
         password,
         device_id: this.deviceId,
+        device_name: deviceName,
       })
       this.applyLogin(unwrapApiData<LoginResult>(data))
+    },
+    async listDevices() {
+      const { data } = await http.get('/users/me/devices')
+      return unwrapApiData<{ devices: DeviceSession[] }>(data).devices || []
+    },
+    async revokeDevice(deviceId: string) {
+      await http.delete(`/users/me/devices/${encodeURIComponent(deviceId)}`)
     },
     applyLogin(res: LoginResult) {
       this.user = this.normalizeUser(res.user)
@@ -90,6 +112,8 @@ export const useAuthStore = defineStore('auth', {
     async updateProfile(fields: {
       nickname?: string
       avatar?: string
+      status_text?: string
+      status_emoji?: string
       gender?: number
       birthday?: string
     }) {
@@ -103,6 +127,12 @@ export const useAuthStore = defineStore('auth', {
       const res = unwrapApiData<{ user: User }>(data)
       this.user = this.normalizeUser(res.user)
       return this.user
+    },
+    async changePassword(oldPassword: string, newPassword: string) {
+      await http.put('/users/me/password', {
+        old_password: oldPassword,
+        new_password: newPassword,
+      })
     },
     async uploadAvatar(blob: Blob) {
       const form = new FormData()

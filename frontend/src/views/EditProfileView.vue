@@ -13,6 +13,8 @@ const auth = useAuthStore()
 const chat = useChatStore()
 
 const nickname = ref('')
+const statusText = ref('')
+const statusEmoji = ref('')
 const gender = ref(0)
 const birthday = ref('')
 const privacy = ref<UserPrivacy>({
@@ -26,6 +28,14 @@ const cropFile = ref<File | null>(null)
 const avatarInput = ref<HTMLInputElement | null>(null)
 const saving = ref(false)
 
+const STATUS_PRESETS = [
+  { emoji: '💼', text: '工作中' },
+  { emoji: '🏠', text: '远程办公' },
+  { emoji: '☕', text: '稍后再回' },
+  { emoji: '✈️', text: '出差中' },
+  { emoji: '', text: '' },
+]
+
 onMounted(async () => {
   if (!auth.user) await auth.restoreSession()
   const u = auth.user
@@ -34,6 +44,8 @@ onMounted(async () => {
     return
   }
   nickname.value = u.nickname || ''
+  statusText.value = u.status_text || ''
+  statusEmoji.value = u.status_emoji || ''
   gender.value = u.gender || 0
   birthday.value = u.birthday || ''
   if (u.privacy) privacy.value = { ...u.privacy }
@@ -65,6 +77,8 @@ async function saveProfile() {
   try {
     await auth.updateProfile({
       nickname: nickname.value.trim(),
+      status_text: statusText.value.trim(),
+      status_emoji: statusEmoji.value.trim(),
       gender: gender.value,
       birthday: birthday.value,
     })
@@ -114,6 +128,40 @@ function avatarUrl() {
       <section class="edit-section">
         <label class="field-label" for="nick">名字</label>
         <input id="nick" v-model="nickname" class="input" type="text" maxlength="32" />
+      </section>
+
+      <section class="edit-section">
+        <label class="field-label" for="status">状态</label>
+        <div class="status-row">
+          <input
+            id="status-emoji"
+            v-model="statusEmoji"
+            class="input status-emoji"
+            type="text"
+            maxlength="8"
+            placeholder="🙂"
+            aria-label="状态表情"
+          />
+          <input
+            id="status"
+            v-model="statusText"
+            class="input"
+            type="text"
+            maxlength="64"
+            placeholder="如：工作中 / 稍后再回"
+          />
+        </div>
+        <div class="status-presets">
+          <button
+            v-for="(p, i) in STATUS_PRESETS"
+            :key="i"
+            type="button"
+            class="preset-chip"
+            @click="statusEmoji = p.emoji; statusText = p.text"
+          >
+            {{ p.emoji || '清空' }}{{ p.text ? ` ${p.text}` : '' }}
+          </button>
+        </div>
       </section>
 
       <section class="edit-section">
@@ -214,6 +262,38 @@ function avatarUrl() {
   padding: var(--space-3);
   color: var(--color-primary);
   font-size: var(--text-sm);
+}
+
+.status-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.status-emoji {
+  width: 56px;
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.status-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--space-2);
+}
+
+.preset-chip {
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.preset-chip:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
 }
 
 .hidden {

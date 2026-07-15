@@ -88,6 +88,28 @@ func (r *Router) RoutesForUser(ctx context.Context, userID int64) ([]DeviceRoute
 	return routes, iter.Err()
 }
 
+// IsUserOnline reports whether any device for the user is currently online.
+func (r *Router) IsUserOnline(ctx context.Context, userID int64) (bool, error) {
+	routes, err := r.RoutesForUser(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return len(routes) > 0, nil
+}
+
+// BatchOnline returns online flags for the given user IDs.
+func (r *Router) BatchOnline(ctx context.Context, userIDs []int64) (map[int64]bool, error) {
+	out := make(map[int64]bool, len(userIDs))
+	for _, id := range userIDs {
+		on, err := r.IsUserOnline(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = on
+	}
+	return out, nil
+}
+
 // PublishToInstance sends push payload to target gateway via Redis pub/sub.
 func (r *Router) PublishToInstance(ctx context.Context, instanceID string, payload []byte) error {
 	if instanceID == r.instanceID {

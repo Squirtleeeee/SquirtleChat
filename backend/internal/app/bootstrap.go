@@ -8,6 +8,7 @@ import (
 	"squirtlechat/internal/handler"
 	"squirtlechat/internal/push"
 	"squirtlechat/internal/service"
+	"squirtlechat/internal/service/linkpreview"
 	"squirtlechat/internal/store"
 	"squirtlechat/internal/ws"
 	"squirtlechat/pkg/config"
@@ -22,17 +23,18 @@ import (
 )
 
 type Container struct {
-	Config     *config.Config
-	Auth       *service.AuthService
-	Message    *service.MessageService
-	Friend     *service.FriendService
-	Sync       *service.SyncService
-	File       *service.FileService
-	Agent      *service.AgentService
-	Hub        *ws.Hub
-	Router     *routing.Router
-	Dispatcher *push.Dispatcher
-	Redis      *goredis.Client
+	Config      *config.Config
+	Auth        *service.AuthService
+	Message     *service.MessageService
+	Friend      *service.FriendService
+	Sync        *service.SyncService
+	File        *service.FileService
+	Agent       *service.AgentService
+	LinkPreview *linkpreview.Service
+	Hub         *ws.Hub
+	Router      *routing.Router
+	Dispatcher  *push.Dispatcher
+	Redis       *goredis.Client
 }
 
 func Bootstrap() (*Container, error) {
@@ -55,14 +57,16 @@ func Bootstrap() (*Container, error) {
 
 	authSvc := service.NewAuthService(userStore, gen, cfg.JWTSecret)
 	writer := pkgkafka.NewWriter(cfg.KafkaBroker, pkgkafka.TopicMessageSent)
-	msgSvc := service.NewMessageService(msgStore, friendStore, gen, writer, cfg.GatewayInstanceID)
 	friendSvc := service.NewFriendService(friendStore, userStore, gen)
+	msgSvc := service.NewMessageService(msgStore, friendStore, gen, writer, cfg.GatewayInstanceID)
+	friendSvc.SetMessageService(msgSvc)
 	syncSvc := service.NewSyncService(syncStore, msgStore, userStore)
 	fileSvc := service.NewFileService(fileStore, gen, cfg)
 	agentSvc := service.NewAgentService(userStore, friendStore, msgStore, msgSvc, gen, cfg)
 	if err := agentSvc.Init(context.Background()); err != nil {
 		log.Printf("agent init warn: %v", err)
 	}
+	lpSvc := linkpreview.New()
 	if cfg.LLMAPIKey != "" {
 		log.Printf("llm configured base=%s model=%s", cfg.LLMAPIBase, cfg.LLMModel)
 	} else {
@@ -83,8 +87,9 @@ func Bootstrap() (*Container, error) {
 		Friend:     friendSvc,
 		Sync:       syncSvc,
 		File:       fileSvc,
-		Agent:      agentSvc,
-		Hub:        hub,
+		Agent:       agentSvc,
+		LinkPreview: lpSvc,
+		Hub:         hub,
 		Router:     router,
 		Dispatcher: dispatcher,
 		Redis:      rdb,
@@ -103,13 +108,14 @@ func (c *Container) RegisterHTTP(r *gin.Engine) {
 	})
 	api := r.Group("/api/v1")
 	fileHandler := handler.NewFileHandler(c.File, c.Auth)
-	handler.NewAuthHandler(c.Auth, c.File, c.Agent).Register(api)
+	handler.NewAuthHandler(c.Auth, c.File, c.Agent, c.Hub.KickDevice, c.Router).Register(api)
 	handler.NewFriendHandler(c.Friend, c.Auth).Register(api)
-	handler.NewMessageHandler(c.Message, c.Auth).Register(api)
+	handler.NewMessageHandler(c.Message, c.Auth, c.Agent).Register(api)
 	handler.NewSyncHandler(c.Sync, c.Auth).Register(api)
 	fileHandler.Register(api)
 	fileHandler.RegisterPublic(r)
 	handler.NewAgentHandler(c.Agent, c.Auth).Register(api)
+	handler.NewLinkPreviewHandler(c.Auth, c.LinkPreview).Register(api)
 }
 
 type wsMsgAdapter struct {

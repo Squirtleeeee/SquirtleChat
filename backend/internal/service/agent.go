@@ -8,6 +8,8 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -232,6 +234,69 @@ func (s *AgentService) WelcomeHint() string {
 
 func (s *AgentService) LLMEnabled() bool {
 	return s.llm.Enabled()
+}
+
+func (s *AgentService) Translate(ctx context.Context, text, targetLang string) (string, string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" || text == "[已撤回]" {
+		return "", "", errors.New("无可翻译文本")
+	}
+	if utf8.RuneCountInString(text) > 4000 {
+		return "", "", errors.New("文本过长，请缩短后再翻译")
+	}
+	if !s.llm.Enabled() {
+		return "", "", errors.New("翻译服务未配置（需要 LLM_API_KEY）")
+	}
+	targetLang = strings.TrimSpace(targetLang)
+	if targetLang == "" {
+		if looksMostlyCJK(text) {
+			targetLang = "en"
+		} else {
+			targetLang = "zh-CN"
+		}
+	}
+	langLabel := targetLang
+	switch strings.ToLower(targetLang) {
+	case "zh", "zh-cn", "zh_cn", "chinese", "中文":
+		langLabel = "简体中文"
+		targetLang = "zh-CN"
+	case "en", "english", "英文":
+		langLabel = "English"
+		targetLang = "en"
+	case "ja", "japanese", "日文", "日本語":
+		langLabel = "日本語"
+		targetLang = "ja"
+	}
+	system := fmt.Sprintf(
+		"You are a precise translator. Translate the user message into %s. "+
+			"Output ONLY the translation, no quotes, no explanation, no preamble.",
+		langLabel,
+	)
+	out, err := s.llm.ChatWithTemp(ctx, []agent.ChatMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: text},
+	}, 0.2)
+	if err != nil {
+		return "", "", err
+	}
+	return out, targetLang, nil
+}
+
+func looksMostlyCJK(s string) bool {
+	cjk, total := 0, 0
+	for _, r := range s {
+		if r <= 32 {
+			continue
+		}
+		total++
+		if unicode.In(r, unicode.Han, unicode.Hangul, unicode.Hiragana, unicode.Katakana) {
+			cjk++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return cjk*2 >= total
 }
 
 func (s *AgentService) LLMBase() string {

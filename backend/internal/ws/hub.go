@@ -85,7 +85,6 @@ func (h *Hub) serveWS(c *gin.Context) {
 
 func (h *Hub) register(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.clients[c.userID] == nil {
 		h.clients[c.userID] = make(map[string]*Client)
 	}
@@ -93,8 +92,12 @@ func (h *Hub) register(c *Client) {
 		old.close()
 	}
 	h.clients[c.userID][c.deviceID] = c
+	h.mu.Unlock()
 	if h.router != nil {
 		_ = h.router.Register(context.Background(), c.userID, c.deviceID)
+	}
+	if h.auth != nil {
+		h.auth.TouchDevice(context.Background(), c.userID, c.deviceID, "")
 	}
 	log.Printf("ws connected user=%d device=%s", c.userID, c.deviceID)
 }
@@ -147,6 +150,27 @@ func (h *Hub) PushToDevice(userID int64, deviceID string, data []byte) {
 	if c, ok := h.clients[userID][deviceID]; ok {
 		h.send(c, data)
 	}
+}
+
+// KickDevice notifies and closes a specific device connection.
+func (h *Hub) KickDevice(userID int64, deviceID string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type": "kick",
+		"payload": map[string]string{
+			"reason": "device_revoked",
+		},
+	})
+	h.mu.Lock()
+	c, ok := h.clients[userID][deviceID]
+	h.mu.Unlock()
+	if !ok {
+		return
+	}
+	h.send(c, payload)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		c.close()
+	}()
 }
 
 func (h *Hub) send(c *Client, data []byte) {

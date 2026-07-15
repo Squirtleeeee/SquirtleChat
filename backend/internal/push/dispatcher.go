@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"squirtlechat/internal/model"
+	"squirtlechat/internal/service"
 	"squirtlechat/internal/store"
 	"squirtlechat/internal/ws"
 	"squirtlechat/pkg/routing"
@@ -63,6 +64,47 @@ func (d *Dispatcher) BroadcastTyping(ctx context.Context, convID string, fromUse
 	}
 }
 
+func (d *Dispatcher) BroadcastReaction(ctx context.Context, evt *service.ReactionEvent) {
+	payload, _ := json.Marshal(gin.H{
+		"type": "reaction",
+		"payload": gin.H{
+			"conversation_id": evt.ConversationID,
+			"msg_id":          strconv.FormatInt(evt.MsgID, 10),
+			"user_id":         strconv.FormatInt(evt.UserID, 10),
+			"emoji":           evt.Emoji,
+			"added":           evt.Added,
+			"reactions":       evt.Summaries,
+		},
+	})
+	targets := map[int64]struct{}{evt.UserID: {}}
+	for _, uid := range evt.ToUserIDs {
+		targets[uid] = struct{}{}
+	}
+	for uid := range targets {
+		d.pushToUser(ctx, uid, "", "", 0, payload)
+	}
+}
+
+func (d *Dispatcher) BroadcastPin(ctx context.Context, evt *service.PinEvent) {
+	payload, _ := json.Marshal(gin.H{
+		"type": "pin",
+		"payload": gin.H{
+			"conversation_id": evt.ConversationID,
+			"msg_id":          strconv.FormatInt(evt.MsgID, 10),
+			"user_id":         strconv.FormatInt(evt.UserID, 10),
+			"pinned":          evt.Pinned,
+			"pins":            evt.Pins,
+		},
+	})
+	targets := map[int64]struct{}{evt.UserID: {}}
+	for _, uid := range evt.ToUserIDs {
+		targets[uid] = struct{}{}
+	}
+	for uid := range targets {
+		d.pushToUser(ctx, uid, "", "", 0, payload)
+	}
+}
+
 func (d *Dispatcher) BroadcastRecall(ctx context.Context, evt *store.RecallEvent) {
 	payload, _ := json.Marshal(gin.H{
 		"type": "recall",
@@ -83,6 +125,75 @@ func (d *Dispatcher) BroadcastRecall(ctx context.Context, evt *store.RecallEvent
 	for uid := range targets {
 		d.pushToUser(ctx, uid, "", "", 0, payload)
 	}
+}
+
+func (d *Dispatcher) BroadcastEdit(ctx context.Context, evt *service.EditEvent) {
+	if evt == nil || evt.Message == nil {
+		return
+	}
+	m := evt.Message
+	payload, _ := json.Marshal(gin.H{
+		"type": "edit",
+		"payload": gin.H{
+			"msg_id":          strconv.FormatInt(m.ID, 10),
+			"client_msg_id":   m.ClientMsgID,
+			"conversation_id": m.ConversationID,
+			"from_user_id":    strconv.FormatInt(m.FromUserID, 10),
+			"seq":             m.Seq,
+			"msg_type":        m.MsgType,
+			"content":         m.Content,
+			"edited_at":       m.EditedAt,
+			"created_at":      m.CreatedAt,
+		},
+	})
+	targets := map[int64]struct{}{m.FromUserID: {}}
+	for _, uid := range evt.ToUserIDs {
+		targets[uid] = struct{}{}
+	}
+	for uid := range targets {
+		d.pushToUser(ctx, uid, "", "", 0, payload)
+	}
+}
+
+func (d *Dispatcher) BroadcastPollVote(ctx context.Context, evt *service.PollVoteEvent) {
+	if evt == nil {
+		return
+	}
+	payload, _ := json.Marshal(gin.H{
+		"type": "poll_vote",
+		"payload": gin.H{
+			"conversation_id": evt.ConversationID,
+			"msg_id":          strconv.FormatInt(evt.MsgID, 10),
+			"user_id":         strconv.FormatInt(evt.UserID, 10),
+			"option_id":       evt.OptionID,
+			"poll":            evt.Result,
+		},
+	})
+	targets := map[int64]struct{}{evt.UserID: {}}
+	for _, uid := range evt.ToUserIDs {
+		targets[uid] = struct{}{}
+	}
+	for uid := range targets {
+		d.pushToUser(ctx, uid, "", "", 0, payload)
+	}
+}
+
+func (d *Dispatcher) BroadcastReminder(ctx context.Context, evt *service.ReminderEvent) {
+	if evt == nil || evt.Reminder == nil {
+		return
+	}
+	r := evt.Reminder
+	payload, _ := json.Marshal(gin.H{
+		"type": "reminder",
+		"payload": gin.H{
+			"id":              strconv.FormatInt(r.ID, 10),
+			"conversation_id": r.ConversationID,
+			"msg_id":          strconv.FormatInt(r.MsgID, 10),
+			"preview":         r.Preview,
+			"remind_at":       r.RemindAt,
+		},
+	})
+	d.pushToUser(ctx, r.UserID, "", "", 0, payload)
 }
 
 func (d *Dispatcher) HandleEvent(ctx context.Context, evt *store.SentEvent) {

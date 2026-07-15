@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"strconv"
+	"strings"
 
 	"squirtlechat/internal/middleware"
 	"squirtlechat/internal/service"
@@ -46,10 +47,22 @@ func (h *FriendHandler) Register(r *gin.RouterGroup) {
 	g.GET("/groups/search", h.searchGroups)
 	g.GET("/groups/:id", h.getGroup)
 	g.PUT("/groups/:id/notice", h.setGroupNotice)
+	g.PUT("/groups/:id/welcome", h.setGroupWelcome)
+	g.PUT("/groups/:id/admin-only", h.setGroupAdminOnly)
+	g.PUT("/groups/:id/slow-mode", h.setGroupSlowMode)
+	g.PUT("/groups/:id/my-nickname", h.setMyGroupNickname)
+	g.POST("/groups/:id/invite-links", h.createInviteLink)
+	g.GET("/groups/:id/invite-links", h.listInviteLinks)
+	g.DELETE("/groups/:id/invite-links/:lid", h.revokeInviteLink)
+	g.GET("/invite-links/:code", h.previewInviteLink)
+	g.POST("/invite-links/:code/join", h.joinInviteLink)
 	g.POST("/groups/:id/face-to-face/refresh", h.refreshFaceToFace)
 	g.GET("/groups/:id/face-to-face", h.getFaceToFace)
 	g.POST("/groups/:id/admins/:uid", h.setGroupAdmin)
 	g.DELETE("/groups/:id/admins/:uid", h.unsetGroupAdmin)
+	g.POST("/groups/:id/members/:uid/mute", h.muteGroupMember)
+	g.DELETE("/groups/:id/members/:uid/mute", h.unmuteGroupMember)
+	g.PUT("/groups/:id/members/:uid/remark", h.setGroupMemberRemark)
 	g.POST("/groups/:id/invites", h.inviteMembers)
 	g.POST("/groups/:id/members", h.addMembers)
 	g.DELETE("/groups/:id/members/:uid", h.removeMember)
@@ -370,6 +383,160 @@ func (h *FriendHandler) setGroupNotice(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"status": "ok", "notice": req.Notice})
+}
+
+func (h *FriendHandler) setGroupWelcome(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		WelcomeText string `json:"welcome_text"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failParam(c, err)
+		return
+	}
+	if err := h.friend.SetGroupWelcome(c.Request.Context(), gid, middleware.UserID(c), req.WelcomeText); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "welcome_text": strings.TrimSpace(req.WelcomeText)})
+}
+
+func (h *FriendHandler) setGroupAdminOnly(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		AdminOnly bool `json:"admin_only"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failParam(c, err)
+		return
+	}
+	if err := h.friend.SetGroupAdminOnly(c.Request.Context(), gid, middleware.UserID(c), req.AdminOnly); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "admin_only": req.AdminOnly})
+}
+
+func (h *FriendHandler) setGroupSlowMode(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		Seconds int `json:"seconds"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failParam(c, err)
+		return
+	}
+	if err := h.friend.SetGroupSlowMode(c.Request.Context(), gid, middleware.UserID(c), req.Seconds); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "slow_mode_secs": req.Seconds})
+}
+
+func (h *FriendHandler) setMyGroupNickname(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		Nickname string `json:"nickname"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failParam(c, err)
+		return
+	}
+	if err := h.friend.SetMyGroupNickname(c.Request.Context(), gid, middleware.UserID(c), req.Nickname); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "nickname": strings.TrimSpace(req.Nickname)})
+}
+
+func (h *FriendHandler) createInviteLink(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		MaxUses      int `json:"max_uses"`
+		ExpiresHours int `json:"expires_hours"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	out, err := h.friend.CreateInviteLink(c.Request.Context(), gid, middleware.UserID(c), req.MaxUses, req.ExpiresHours)
+	if err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, out)
+}
+
+func (h *FriendHandler) listInviteLinks(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	out, err := h.friend.ListInviteLinks(c.Request.Context(), gid, middleware.UserID(c))
+	if err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"links": out})
+}
+
+func (h *FriendHandler) revokeInviteLink(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	lid, _ := strconv.ParseInt(c.Param("lid"), 10, 64)
+	if err := h.friend.RevokeInviteLink(c.Request.Context(), gid, lid, middleware.UserID(c)); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok"})
+}
+
+func (h *FriendHandler) previewInviteLink(c *gin.Context) {
+	out, err := h.friend.PreviewInviteLink(c.Request.Context(), c.Param("code"), middleware.UserID(c))
+	if err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, out)
+}
+
+func (h *FriendHandler) joinInviteLink(c *gin.Context) {
+	out, err := h.friend.JoinViaInviteLink(c.Request.Context(), c.Param("code"), middleware.UserID(c))
+	if err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, out)
+}
+
+func (h *FriendHandler) muteGroupMember(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	uid, _ := strconv.ParseInt(c.Param("uid"), 10, 64)
+	if err := h.friend.SetGroupMemberMuted(c.Request.Context(), gid, middleware.UserID(c), uid, true); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "muted": true})
+}
+
+func (h *FriendHandler) unmuteGroupMember(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	uid, _ := strconv.ParseInt(c.Param("uid"), 10, 64)
+	if err := h.friend.SetGroupMemberMuted(c.Request.Context(), gid, middleware.UserID(c), uid, false); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "muted": false})
+}
+
+func (h *FriendHandler) setGroupMemberRemark(c *gin.Context) {
+	gid, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	uid, _ := strconv.ParseInt(c.Param("uid"), 10, 64)
+	var req struct {
+		Remark string `json:"remark"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failParam(c, err)
+		return
+	}
+	if err := h.friend.SetGroupMemberRemark(c.Request.Context(), gid, middleware.UserID(c), uid, req.Remark); err != nil {
+		failConflict(c, err)
+		return
+	}
+	response.OK(c, gin.H{"status": "ok", "remark": strings.TrimSpace(req.Remark)})
 }
 
 func (h *FriendHandler) addMembers(c *gin.Context) {

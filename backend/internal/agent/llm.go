@@ -60,10 +60,14 @@ type chatResponse struct {
 }
 
 func (c *Client) Chat(ctx context.Context, messages []ChatMessage) (string, error) {
+	return c.ChatWithTemp(ctx, messages, 0.88)
+}
+
+func (c *Client) ChatWithTemp(ctx context.Context, messages []ChatMessage, temperature float64) (string, error) {
 	if !c.Enabled() {
 		return "", errors.New("llm disabled")
 	}
-	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Temperature: 0.88})
+	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Temperature: temperature})
 	if err != nil {
 		return "", err
 	}

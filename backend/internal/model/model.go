@@ -22,6 +22,8 @@ type User struct {
 	PasswordHash string      `json:"-"`
 	Nickname     string      `json:"nickname"`
 	Avatar       string      `json:"avatar"`
+	StatusText   string      `json:"status_text"`
+	StatusEmoji  string      `json:"status_emoji"`
 	Gender       int8        `json:"gender"`
 	Birthday     *string     `json:"birthday,omitempty"`
 	Privacy      UserPrivacy `json:"privacy"`
@@ -30,12 +32,14 @@ type User struct {
 
 // PublicProfile is visible to other users (privacy-filtered).
 type PublicProfile struct {
-	ID       int64  `json:"id,string"`
-	Username string `json:"username"`
-	Nickname string `json:"nickname,omitempty"`
-	Avatar   string `json:"avatar,omitempty"`
-	Gender   int8   `json:"gender,omitempty"`
-	Birthday string `json:"birthday,omitempty"`
+	ID          int64  `json:"id,string"`
+	Username    string `json:"username"`
+	Nickname    string `json:"nickname,omitempty"`
+	Avatar      string `json:"avatar,omitempty"`
+	StatusText  string `json:"status_text,omitempty"`
+	StatusEmoji string `json:"status_emoji,omitempty"`
+	Gender      int8   `json:"gender,omitempty"`
+	Birthday    string `json:"birthday,omitempty"`
 }
 
 func (u *User) ApplyPrivacy(viewerIsSelf bool) PublicProfile {
@@ -46,10 +50,14 @@ func (u *User) ApplyPrivacy(viewerIsSelf bool) PublicProfile {
 		}
 		return PublicProfile{
 			ID: u.ID, Username: u.Username, Nickname: u.Nickname,
-			Avatar: u.Avatar, Gender: u.Gender, Birthday: bday,
+			Avatar: u.Avatar, StatusText: u.StatusText, StatusEmoji: u.StatusEmoji,
+			Gender: u.Gender, Birthday: bday,
 		}
 	}
-	out := PublicProfile{ID: u.ID, Username: u.Username}
+	out := PublicProfile{
+		ID: u.ID, Username: u.Username,
+		StatusText: u.StatusText, StatusEmoji: u.StatusEmoji,
+	}
 	if u.Privacy.ShowNickname && u.Nickname != "" {
 		out.Nickname = u.Nickname
 	}
@@ -75,14 +83,15 @@ func ParsePrivacyJSON(raw []byte) UserPrivacy {
 }
 
 type Message struct {
-	ID             int64     `json:"msg_id"`
-	ConversationID string    `json:"conversation_id"`
-	FromUserID     int64     `json:"from_user_id,string"`
-	Seq            int64     `json:"seq"`
-	MsgType        int8      `json:"msg_type"`
-	Content        string    `json:"content"`
-	ClientMsgID    string    `json:"client_msg_id"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             int64      `json:"msg_id"`
+	ConversationID string     `json:"conversation_id"`
+	FromUserID     int64      `json:"from_user_id,string"`
+	Seq            int64      `json:"seq"`
+	MsgType        int8       `json:"msg_type"`
+	Content        string     `json:"content"`
+	ClientMsgID    string     `json:"client_msg_id"`
+	CreatedAt      time.Time  `json:"created_at"`
+	EditedAt       *time.Time `json:"edited_at,omitempty"`
 }
 
 const (
@@ -92,4 +101,6 @@ const (
 	MsgTypeImage   = 2
 	MsgTypeFile    = 3
 	MsgTypeSystem  = 4
+	MsgTypeAudio   = 5
+	MsgTypePoll    = 6
 )

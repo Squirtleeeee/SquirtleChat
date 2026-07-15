@@ -36,7 +36,7 @@ func (s *SyncStore) ListMessagesSince(ctx context.Context, userID, sinceSeq int6
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.id, m.conversation_id, m.from_user_id, m.seq, m.msg_type, m.content, m.client_msg_id, m.created_at
+		SELECT m.id, m.conversation_id, m.from_user_id, m.seq, m.msg_type, m.content, m.client_msg_id, m.created_at, m.edited_at
 		FROM messages m
 		INNER JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
 		WHERE m.id > ?
@@ -49,8 +49,13 @@ func (s *SyncStore) ListMessagesSince(ctx context.Context, userID, sinceSeq int6
 	var list []*model.Message
 	for rows.Next() {
 		m := &model.Message{}
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromUserID, &m.Seq, &m.MsgType, &m.Content, &m.ClientMsgID, &m.CreatedAt); err != nil {
+		var edited sql.NullTime
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromUserID, &m.Seq, &m.MsgType, &m.Content, &m.ClientMsgID, &m.CreatedAt, &edited); err != nil {
 			return nil, err
+		}
+		if edited.Valid {
+			t := edited.Time
+			m.EditedAt = &t
 		}
 		list = append(list, m)
 	}

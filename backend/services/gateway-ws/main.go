@@ -39,6 +39,15 @@ func main() {
 	c.Message.SetOnTyping(func(ctx context.Context, evt *service.TypingEvent) {
 		c.Dispatcher.BroadcastTyping(ctx, evt.ConversationID, evt.FromUserID, evt.Typing, evt.ToUserIDs)
 	})
+	c.Message.SetOnReaction(func(ctx context.Context, evt *service.ReactionEvent) {
+		c.Dispatcher.BroadcastReaction(ctx, evt)
+	})
+	c.Message.SetOnPin(func(ctx context.Context, evt *service.PinEvent) {
+		c.Dispatcher.BroadcastPin(ctx, evt)
+	})
+	c.Message.SetOnPollVote(func(ctx context.Context, evt *service.PollVoteEvent) {
+		c.Dispatcher.BroadcastPollVote(ctx, evt)
+	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

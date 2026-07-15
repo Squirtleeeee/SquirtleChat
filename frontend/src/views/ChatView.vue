@@ -5,22 +5,25 @@ import { parseError } from '../api/errors'
 import AddContactModal from '../components/AddContactModal.vue'
 import ImageLightbox from '../components/ImageLightbox.vue'
 import UserAvatar from '../components/UserAvatar.vue'
+import LinkPreviewCard from '../components/LinkPreviewCard.vue'
 import { useAuthStore } from '../stores/auth'
 import {
   friendDisplayName,
   parseFileContent,
   useChatStore,
+  REACTION_EMOJIS,
   type ChatMessage,
   type FriendWithConv,
   type GroupWithConv,
 } from '../stores/chat'
 import type { PublicProfile } from '../stores/auth'
-import { dayKey, formatDateDivider, formatListTime, formatMessageTime } from '../utils/format'
+import { dayKey, formatDateDivider, formatListTime, formatMessageTime, previewMessage } from '../utils/format'
 import { ensureNotifyPermission } from '../utils/notify'
-import { directConvId, sameId } from '../utils/id'
+import { directConvId, idStr, sameId } from '../utils/id'
 import { mediaUrl } from '../utils/media'
 import { isAgentProfile, AGENT_AVATAR } from '../constants/agent'
-import { parseReplyContent, type ReplyMeta } from '../utils/reply'
+import { buildReplyContent, parseReplyContent, type ReplyMeta } from '../utils/reply'
+import { firstHttpUrl } from '../utils/link'
 import { useSettingsStore } from '../stores/settings'
 import { openDetachedChat } from '../utils/desktop'
 
@@ -32,18 +35,68 @@ const settings = useSettingsStore()
 const router = useRouter()
 const input = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
+const recording = ref(false)
+const recordSecs = ref(0)
+let mediaRecorder: MediaRecorder | null = null
+let recordChunks: BlobPart[] = []
+let recordTimer = 0
+let recordStartedAt = 0
 const messageListEl = ref<HTMLElement | null>(null)
 const showAddModal = ref(false)
 const filterQuery = ref('')
 const previewImage = ref('')
 const showSearch = ref(false)
+const searchHitIndex = ref(-1)
+const showPins = ref(false)
+const showBookmarks = ref(false)
+const bookmarkTitle = ref('')
+const bookmarkUrl = ref('')
+const editingMsgId = ref('')
+const editDraft = ref('')
+const showStars = ref(false)
+const showSchedule = ref(false)
+const showReminders = ref(false)
+const showMedia = ref(false)
+const showMentions = ref(false)
+const showPollComposer = ref(false)
+const pollQuestion = ref('')
+const pollOptions = ref(['', ''])
+const scheduleAtLocal = ref('')
+const scheduledItems = ref<{ id: string; conversation_id: string; content: string; send_at: string }[]>([])
 const searchInput = ref('')
 const searchInputEl = ref<HTMLInputElement | null>(null)
 const skipAutoScroll = ref(false)
 let searchDebounce = 0
 const DRAFT_KEY = 'squirtlechat_drafts'
+const NOTICE_DISMISS_KEY = 'squirtlechat_notice_dismissed'
 const draftsMap = ref<Record<string, string>>(loadDrafts())
+let draftSyncTimer = 0
+const pendingDraftSync = new Set<string>()
+const noticeDismissed = ref<Record<string, string>>(loadNoticeDismissed())
 const mentionOpen = ref(false)
+
+function loadNoticeDismissed(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(NOTICE_DISMISS_KEY) || '{}') as Record<string, string>
+  } catch {
+    return {}
+  }
+}
+
+function dismissActiveNotice() {
+  const gid = chat.activeGroupId
+  const notice = chat.activeGroupNotice
+  if (!gid || !notice) return
+  noticeDismissed.value = { ...noticeDismissed.value, [gid]: notice }
+  localStorage.setItem(NOTICE_DISMISS_KEY, JSON.stringify(noticeDismissed.value))
+}
+
+const showGroupNoticeBar = computed(() => {
+  const gid = chat.activeGroupId
+  const notice = chat.activeGroupNotice
+  if (!gid || !notice) return false
+  return noticeDismissed.value[gid] !== notice
+})
 const mentionQuery = ref('')
 const mentionStart = ref(-1)
 const composerInputEl = ref<HTMLTextAreaElement | null>(null)
@@ -67,6 +120,72 @@ const nearBottom = ref(true)
 const pendingNewCount = ref(0)
 const selectMode = ref(false)
 const selectedMsgIds = ref<Set<string>>(new Set())
+const forwardOpen = ref(false)
+const forwardQuery = ref('')
+const forwarding = ref(false)
+const reactPickerFor = ref('')
+const groupReadPopupFor = ref('')
+
+function toggleReactPicker(clientMsgId: string) {
+  reactPickerFor.value = reactPickerFor.value === clientMsgId ? '' : clientMsgId
+}
+
+function toggleGroupReadPopup(clientMsgId: string) {
+  const next = groupReadPopupFor.value === clientMsgId ? '' : clientMsgId
+  groupReadPopupFor.value = next
+  if (next && chat.activeConvId) {
+    void chat.loadReadState(chat.activeConvId)
+  }
+}
+
+function groupReadProfile(userId: string): PublicProfile | undefined {
+  return (
+    chat.activeGroupMembers.find((x) => sameId(x.id, userId)) ||
+    chat.friends.find((x) => sameId(x.id, userId))
+  )
+}
+
+function groupReadName(userId: string) {
+  const m = groupReadProfile(userId)
+  if (!m) return userId
+  const f = chat.friends.find((x) => sameId(x.id, userId))
+  if (f) return friendDisplayName(f)
+  return chat.mentionName(m)
+}
+
+function groupReadAvatar(userId: string) {
+  return avatarUrl(groupReadProfile(userId)?.avatar)
+}
+
+function openGroupReadProfile(userId: string) {
+  groupReadPopupFor.value = ''
+  router.push(`/profile/${userId}`)
+}
+
+async function onPickReaction(m: ChatMessage, emoji: string) {
+  reactPickerFor.value = ''
+  await chat.toggleReaction(m, emoji)
+}
+
+async function runGlobalSearch() {
+  await chat.searchGlobal(filterQuery.value)
+}
+
+function convTitleHint(convId: string) {
+  if (convId.startsWith('g_')) {
+    const g = chat.groups.find((x) => x.conversation_id === convId)
+    return g?.name || '群聊'
+  }
+  const parts = convId.split('_')
+  const other = parts.find((p) => !sameId(p, auth.user?.id))
+  const f = chat.friends.find((x) => sameId(x.id, other))
+  return f ? friendDisplayName(f) : '私聊'
+}
+
+async function openGlobalHit(m: ChatMessage) {
+  await chat.jumpToMessage(m)
+  mobileSidebarOpen.value = false
+}
 /** seq after which messages are "new" when opening a conversation with unread */
 const unreadDividerAfterSeq = ref(0)
 const replyTarget = ref<ReplyMeta | null>(null)
@@ -77,6 +196,12 @@ const confirmDialog = ref<{
   confirmLabel?: string
   danger?: boolean
   onConfirm: () => void | Promise<void>
+} | null>(null)
+const draftConflict = ref<{
+  convId: string
+  local: string
+  remote: string
+  rest: { convId: string; local: string; remote: string }[]
 } | null>(null)
 let longPressTimer = 0
 let longPressMoved = false
@@ -110,6 +235,13 @@ const mentionCandidates = computed(() => {
     .slice(0, 8)
 })
 
+const mentionShowAll = computed(() => {
+  if (!chat.activeGroupId || !mentionOpen.value) return false
+  const q = mentionQuery.value.trim().toLowerCase()
+  if (!q) return true
+  return '所有人'.includes(q) || 'all'.includes(q) || q.includes('全')
+})
+
 function loadDrafts(): Record<string, string> {
   try {
     const raw = localStorage.getItem(DRAFT_KEY)
@@ -125,6 +257,27 @@ function persistDrafts() {
   localStorage.setItem(DRAFT_KEY, JSON.stringify(draftsMap.value))
 }
 
+function queueDraftSync(convId: string) {
+  pendingDraftSync.add(convId)
+  window.clearTimeout(draftSyncTimer)
+  draftSyncTimer = window.setTimeout(() => {
+    void flushDraftSync()
+  }, 800)
+}
+
+async function flushDraftSync() {
+  const ids = [...pendingDraftSync]
+  pendingDraftSync.clear()
+  for (const convId of ids) {
+    const content = draftsMap.value[convId] || ''
+    try {
+      await chat.persistDraft(convId, content)
+    } catch {
+      pendingDraftSync.add(convId)
+    }
+  }
+}
+
 function saveDraft(convId: string, text: string) {
   if (!convId) return
   const next = { ...draftsMap.value }
@@ -136,6 +289,7 @@ function saveDraft(convId: string, text: string) {
   }
   draftsMap.value = next
   persistDrafts()
+  queueDraftSync(convId)
 }
 
 function readDraft(convId: string) {
@@ -147,6 +301,87 @@ function draftPreview(convId: string) {
   const d = (draftsMap.value[convId] || '').trim()
   if (!d) return ''
   return d.length > 24 ? `${d.slice(0, 24)}…` : d
+}
+
+async function syncDraftsFromCloud() {
+  try {
+    const remote = await chat.loadDrafts()
+    if (!remote) return
+    const merged = { ...draftsMap.value }
+    const localOnly: string[] = []
+    const conflicts: { convId: string; local: string; remote: string }[] = []
+
+    for (const [k, v] of Object.entries(remote)) {
+      if (typeof v !== 'string' || !v) continue
+      const local = (draftsMap.value[k] || '').trim()
+      const cloud = v.trim()
+      if (local && cloud && local !== cloud) {
+        conflicts.push({ convId: k, local, remote: cloud })
+        continue
+      }
+      if (!local && cloud) merged[k] = v
+    }
+    for (const [k, v] of Object.entries(draftsMap.value)) {
+      if (v && !(k in remote)) localOnly.push(k)
+    }
+
+    // non-conflicting merges first
+    for (const c of conflicts) {
+      // keep previous local until resolved
+      merged[c.convId] = c.local
+    }
+    draftsMap.value = merged
+    persistDrafts()
+    for (const k of localOnly) {
+      queueDraftSync(k)
+    }
+    if (conflicts.length) {
+      const [first, ...rest] = conflicts
+      draftConflict.value = { ...first, rest }
+      chat.setTransientNotice(`发现 ${conflicts.length} 处草稿冲突，请选择保留版本`)
+    } else if (chat.activeConvId) {
+      input.value = readDraft(chat.activeConvId)
+    }
+  } catch {
+    /* keep local */
+  }
+}
+
+function applyDraftConflict(keep: 'local' | 'cloud') {
+  const cur = draftConflict.value
+  if (!cur) return
+  const next = { ...draftsMap.value }
+  if (keep === 'cloud') {
+    next[cur.convId] = cur.remote
+  } else {
+    next[cur.convId] = cur.local
+    queueDraftSync(cur.convId)
+  }
+  draftsMap.value = next
+  persistDrafts()
+  if (chat.activeConvId === cur.convId) {
+    input.value = next[cur.convId] || ''
+  }
+  if (cur.rest.length) {
+    const [first, ...rest] = cur.rest
+    draftConflict.value = { ...first, rest }
+  } else {
+    draftConflict.value = null
+    chat.setTransientNotice(keep === 'local' ? '已保留本地草稿' : '已采用云端草稿')
+  }
+}
+
+function draftConflictTitle(convId: string) {
+  const g = chat.groups.find((x) => x.conversation_id === convId)
+  if (g) return g.name
+  const myId = idStr(auth.user?.id)
+  const f = chat.friends.find((x) => directConvId(myId, x.id) === convId)
+  return f ? friendDisplayName(f) : '会话'
+}
+
+function previewDraftSnippet(text: string) {
+  const t = text.trim().replace(/\s+/g, ' ')
+  return t.length > 80 ? `${t.slice(0, 80)}…` : t
 }
 
 type DisplayItem =
@@ -172,19 +407,49 @@ function sameCluster(a: ChatMessage, b: ChatMessage) {
 const activeTitle = computed(() => chat.activeTitle || 'SquirtleChat')
 const filterText = computed(() => filterQuery.value.trim().toLowerCase())
 const filteredFriends = computed(() => {
+  let list = chat.sortedFriends.filter((f) => chat.friendInActiveFolder(f.id))
   const q = filterText.value
-  if (!q) return chat.sortedFriends
-  return chat.sortedFriends.filter((f) => {
+  if (!q) return list
+  return list.filter((f) => {
     const name = friendDisplayName(f).toLowerCase()
     const user = f.username.toLowerCase()
     return name.includes(q) || user.includes(q) || (f.remark || '').toLowerCase().includes(q)
   })
 })
 const filteredGroups = computed(() => {
+  let list = chat.sortedGroups.filter((g) => chat.groupInActiveFolder(g))
   const q = filterText.value
-  if (!q) return chat.sortedGroups
-  return chat.sortedGroups.filter((g) => g.name.toLowerCase().includes(q))
+  if (!q) return list
+  return list.filter((g) => g.name.toLowerCase().includes(q))
 })
+const newFolderName = ref('')
+const showFolderManage = ref(false)
+
+function ctxConvId(): string {
+  const menu = ctxMenu.value
+  if (!menu) return ''
+  if (menu.kind === 'friend') return directConvId(auth.user?.id || '', menu.id)
+  return chat.groups.find((x) => x.id === menu.id)?.conversation_id || ''
+}
+
+function ctxAssignFolder(folderId: string) {
+  const convId = ctxConvId()
+  closeCtxMenu()
+  if (!convId) return
+  chat.assignConvToFolder(folderId, convId)
+}
+
+function ctxRemoveFromFolders() {
+  const convId = ctxConvId()
+  closeCtxMenu()
+  if (!convId) return
+  chat.removeConvFromFolders(convId)
+}
+
+function submitNewFolder() {
+  chat.createFolder(newFolderName.value)
+  newFolderName.value = ''
+}
 const displayItems = computed((): DisplayItem[] => {
   const list = chat.messages[chat.activeConvId || ''] || []
   const items: DisplayItem[] = []
@@ -337,6 +602,25 @@ function onGlobalKeydown(e: KeyboardEvent) {
     }
     return
   }
+  if (showSearch.value && chat.searchResults.length) {
+    if (e.key === 'F3' || ((e.ctrlKey || e.metaKey) && (e.key === 'g' || e.key === 'G'))) {
+      e.preventDefault()
+      void jumpSearchHit(e.shiftKey ? -1 : 1)
+      return
+    }
+    if (document.activeElement === searchInputEl.value) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        void jumpSearchHit(1)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        void jumpSearchHit(-1)
+        return
+      }
+    }
+  }
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && chat.activeConvId) {
     e.preventDefault()
     send()
@@ -364,12 +648,19 @@ onMounted(async () => {
       chat.ensureAgent(),
       chat.loadFriends(),
       chat.loadGroups(),
-      chat.loadPending(),
       chat.loadConversations(),
+      chat.loadPending(),
+      chat.loadGroupInvitations(),
+      chat.loadChatPrefs(),
+      chat.loadReminders(),
     ])
+    await syncDraftsFromCloud()
     await chat.pullSync()
     setInterval(() => chat.pullSync(), 3000)
     setInterval(() => chat.loadPending(), 8000)
+    setInterval(() => {
+      void chat.refreshPresence(chat.friends.map((f) => f.id))
+    }, 20000)
   } catch (e) {
     chat.setError(parseError(e))
   } finally {
@@ -382,11 +673,20 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onGlobalKeydown)
   window.removeEventListener('click', closeCtxMenu)
   clearLongPress()
+  window.clearTimeout(draftSyncTimer)
+  void flushDraftSync()
 })
 
 function send() {
-  if (mentionOpen.value && mentionCandidates.value.length) {
-    insertMention(mentionCandidates.value[0])
+  if (mentionOpen.value && (mentionShowAll.value || mentionCandidates.value.length)) {
+    if (mentionShowAll.value && !mentionCandidates.value.length) insertMentionAll()
+    else if (mentionShowAll.value && !mentionQuery.value.trim()) insertMentionAll()
+    else if (mentionCandidates.value.length) insertMention(mentionCandidates.value[0])
+    else insertMentionAll()
+    return
+  }
+  if (chat.activeGroupId && !chat.canPostInActiveGroup) {
+    chat.setTransientNotice(chat.activeGroupPostBlockReason || '暂时无法发言')
     return
   }
   const text = input.value.trim()
@@ -464,6 +764,14 @@ function updateMentionState() {
 
 function insertMention(user: PublicProfile) {
   const name = chat.mentionName(user)
+  insertMentionToken(name)
+}
+
+function insertMentionAll() {
+  insertMentionToken('所有人')
+}
+
+function insertMentionToken(name: string) {
   const start = mentionStart.value
   const el = composerInputEl.value
   const caret = el?.selectionStart ?? input.value.length
@@ -528,7 +836,16 @@ function renderMessageHtml(content: string) {
   )
   return withLinks
     .replace(/@([^\s@]+)/g, '<span class="mention">@$1</span>')
+    .replace(/(^|[\s([{（【「『])#([a-zA-Z0-9_\u4e00-\u9fff]{1,64})/g, (_m, pre, tag) => {
+      return `${pre}<button type="button" class="msg-hashtag" data-tag="${tag}">#${tag}</button>`
+    })
     .replace(/\n/g, '<br>')
+}
+
+function messageLink(m: ChatMessage) {
+  if (m.msg_type !== 1) return null
+  const text = parseReplyContent(m.content).text || messageBody(m)
+  return firstHttpUrl(text)
 }
 
 function canReply(m: ChatMessage) {
@@ -645,6 +962,84 @@ async function onFileChange(e: Event) {
     await chat.uploadAndSend(file)
   } catch (err) {
     chat.setError(parseError(err))
+  }
+}
+
+async function startVoiceRecord() {
+  if (recording.value || chat.uploading || !chat.activeConvId) return
+  if (!navigator.mediaDevices?.getUserMedia) {
+    chat.setTransientNotice('当前环境不支持录音')
+    return
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    recordChunks = []
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : ''
+    mediaRecorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
+    mediaRecorder.ondataavailable = (ev) => {
+      if (ev.data.size > 0) recordChunks.push(ev.data)
+    }
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop())
+      window.clearInterval(recordTimer)
+      const duration = Math.max(1, Math.round((Date.now() - recordStartedAt) / 1000))
+      const type = mediaRecorder?.mimeType || 'audio/webm'
+      const blob = new Blob(recordChunks, { type })
+      mediaRecorder = null
+      recording.value = false
+      recordSecs.value = 0
+      if (blob.size < 200) {
+        chat.setTransientNotice('录音太短')
+        return
+      }
+      await chat.sendVoice(blob, duration)
+    }
+    mediaRecorder.start(200)
+    recording.value = true
+    recordStartedAt = Date.now()
+    recordSecs.value = 0
+    recordTimer = window.setInterval(() => {
+      recordSecs.value = Math.round((Date.now() - recordStartedAt) / 1000)
+      if (recordSecs.value >= 60) stopVoiceRecord()
+    }, 250)
+  } catch {
+    chat.setTransientNotice('无法访问麦克风')
+  }
+}
+
+function stopVoiceRecord() {
+  if (!recording.value || !mediaRecorder) return
+  if (mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+}
+
+function cancelVoiceRecord() {
+  if (!mediaRecorder) {
+    recording.value = false
+    return
+  }
+  const rec = mediaRecorder
+  rec.ondataavailable = null
+  rec.onstop = () => {
+    rec.stream.getTracks().forEach((t) => t.stop())
+    mediaRecorder = null
+  }
+  if (rec.state !== 'inactive') rec.stop()
+  else rec.stream.getTracks().forEach((t) => t.stop())
+  window.clearInterval(recordTimer)
+  recording.value = false
+  recordSecs.value = 0
+  recordChunks = []
+}
+
+function voiceMeta(m: ChatMessage) {
+  const f = parseFileContent(m.content)
+  return {
+    url: m.localPreview || (f?.url ? mediaUrl(f.url) : ''),
+    duration: f?.duration || 1,
   }
 }
 
@@ -870,13 +1265,14 @@ function onBubbleTouchEnd() {
   resetBubbleSwipe()
 }
 
-function runMsgMenu(action: 'reply' | 'copy' | 'recall' | 'select') {
+function runMsgMenu(action: 'reply' | 'copy' | 'translate' | 'recall' | 'select') {
   const menu = msgMenu.value
   msgMenu.value = null
   if (!menu) return
   const m = menu.message
   if (action === 'reply') startReply(m)
   else if (action === 'copy') void copyText(messageBody(m))
+  else if (action === 'translate') void chat.translateMessage(m)
   else if (action === 'recall') void recallMsg(m)
   else if (action === 'select') {
     selectMode.value = true
@@ -889,6 +1285,9 @@ function msgMenuReply() {
 }
 function msgMenuCopy() {
   runMsgMenu('copy')
+}
+function msgMenuTranslate() {
+  runMsgMenu('translate')
 }
 function msgMenuRecall() {
   runMsgMenu('recall')
@@ -992,6 +1391,31 @@ function toggleSelectMode() {
   if (!selectMode.value) selectedMsgIds.value = new Set()
 }
 
+function selectAllVisibleMessages() {
+  const list = chat.messages[chat.activeConvId || ''] || []
+  selectedMsgIds.value = new Set(
+    list.filter((m) => m.msg_type !== 4 && m.content !== '[已撤回]').map((m) => m.client_msg_id),
+  )
+}
+
+function clearSelectedMessages() {
+  selectedMsgIds.value = new Set()
+}
+
+const selectedStarrableCount = computed(
+  () =>
+    selectedMessagesInOrder().filter((m) => m.msg_id && m.msg_type !== 4 && !chat.isStarred(m.msg_id))
+      .length,
+)
+
+async function starSelectedMessages() {
+  const msgs = selectedMessagesInOrder()
+  if (!msgs.length) return
+  await chat.batchStar(msgs)
+  selectMode.value = false
+  selectedMsgIds.value = new Set()
+}
+
 function toggleSelectMsg(clientMsgId: string) {
   const next = new Set(selectedMsgIds.value)
   if (next.has(clientMsgId)) next.delete(clientMsgId)
@@ -1032,12 +1456,118 @@ async function copySelectedMessages() {
   selectedMsgIds.value = new Set()
 }
 
+const forwardFriends = computed(() => {
+  const q = forwardQuery.value.trim().toLowerCase()
+  return chat.sortedFriends.filter((f) => {
+    if (!q) return true
+    return friendDisplayName(f).toLowerCase().includes(q) || f.username.toLowerCase().includes(q)
+  })
+})
+
+const forwardGroups = computed(() => {
+  const q = forwardQuery.value.trim().toLowerCase()
+  return chat.sortedGroups.filter((g) => {
+    if (!q) return true
+    return g.name.toLowerCase().includes(q)
+  })
+})
+
+function openForwardPicker() {
+  if (!selectedCount.value) return
+  const eligible = selectedMessagesInOrder().filter(
+    (m) => m.msg_type !== 4 && m.content !== '[已撤回]',
+  )
+  if (!eligible.length) {
+    chat.setTransientNotice('没有可转发的消息')
+    return
+  }
+  if (eligible.length > 30) {
+    chat.setError('一次最多转发 30 条，请减少选择')
+    return
+  }
+  forwardQuery.value = ''
+  forwardOpen.value = true
+}
+
+function closeForwardPicker() {
+  forwardOpen.value = false
+  forwarding.value = false
+}
+
+async function forwardToFriend(f: FriendWithConv) {
+  const msgs = selectedMessagesInOrder()
+  if (!msgs.length || forwarding.value) return
+  forwarding.value = true
+  try {
+    const convId = directConvId(auth.user?.id || '', f.id)
+    await chat.forwardMessages(
+      { conversationId: convId, conversationType: 1, toUserId: String(f.id) },
+      msgs,
+    )
+    selectMode.value = false
+    selectedMsgIds.value = new Set()
+    closeForwardPicker()
+  } finally {
+    forwarding.value = false
+  }
+}
+
+async function forwardToGroup(g: GroupWithConv) {
+  const msgs = selectedMessagesInOrder()
+  if (!msgs.length || forwarding.value) return
+  forwarding.value = true
+  try {
+    await chat.forwardMessages(
+      {
+        conversationId: g.conversation_id,
+        conversationType: 2,
+        groupId: String(g.id),
+      },
+      msgs,
+    )
+    selectMode.value = false
+    selectedMsgIds.value = new Set()
+    closeForwardPicker()
+  } finally {
+    forwarding.value = false
+  }
+}
+
 function canRecall(m: ChatMessage) {
   if (!sameId(m.from_user_id, auth.user?.id)) return false
   if (m.msg_type === 4 || m.content === '[已撤回]') return false
   if (!m.msg_id) return false
   if (!m.created_at) return true
   return Date.now() - new Date(m.created_at).getTime() < 2 * 60 * 1000
+}
+
+function canEdit(m: ChatMessage) {
+  if (!sameId(m.from_user_id, auth.user?.id)) return false
+  if (m.msg_type !== 1) return false
+  if (m.content === '[已撤回]') return false
+  if (!m.msg_id) return false
+  if (parseFileContent(m.content)) return false
+  if (!m.created_at) return true
+  return Date.now() - new Date(m.created_at).getTime() < 15 * 60 * 1000
+}
+
+function startEdit(m: ChatMessage) {
+  editingMsgId.value = m.client_msg_id
+  editDraft.value = messageBody(m)
+}
+
+function cancelEdit() {
+  editingMsgId.value = ''
+  editDraft.value = ''
+}
+
+async function saveEdit(m: ChatMessage) {
+  const reply = messageReply(m)
+  const body = editDraft.value.trim()
+  if (!body) return
+  const content = reply ? buildReplyContent(reply, body) : body
+  await chat.editMessage(m, content)
+  cancelEdit()
 }
 
 async function recallMsg(m: ChatMessage) {
@@ -1219,12 +1749,21 @@ async function scrollToBottom(force = false, smooth = false) {
   pendingNewCount.value = 0
 }
 
-/** 打开会话或历史加载后，多次尝试滚到最新消息（等待 DOM 布局完成） */
+/** 打开会话或历史加载后：有未读则定位到未读分隔线，否则滚到底 */
 async function scrollToLatestOnOpen() {
   nearBottom.value = true
   pendingNewCount.value = 0
   skipAutoScroll.value = true
   try {
+    await nextTick()
+    if (unreadDividerAfterSeq.value > 0) {
+      for (let i = 0; i < 4; i++) {
+        const hit = await jumpToFirstUnread(false)
+        if (hit) break
+        await new Promise<void>((r) => requestAnimationFrame(() => r()))
+      }
+      return
+    }
     for (let i = 0; i < 4; i++) {
       await scrollToBottom(true, false)
       await new Promise<void>((r) => requestAnimationFrame(() => r()))
@@ -1240,24 +1779,266 @@ function jumpToLatest() {
   void scrollToBottom(true, true)
 }
 
+async function jumpToFirstUnread(smooth = true): Promise<boolean> {
+  await nextTick()
+  const el = messageListEl.value
+  if (!el) return false
+  const sep = el.querySelector('#unread-sep, [data-unread-sep="1"]') as HTMLElement | null
+  if (!sep) return false
+  sep.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'center' })
+  nearBottom.value = isNearBottom(el)
+  return true
+}
+
+const hasUnreadMarker = computed(() => unreadDividerAfterSeq.value > 0)
+
 function toggleSearch() {
   showSearch.value = !showSearch.value
   if (!showSearch.value) {
     searchInput.value = ''
+    searchHitIndex.value = -1
     chat.clearSearch()
   } else {
+    showPins.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    showSchedule.value = false
+    showReminders.value = false
+    void chat.loadHashtags()
     void nextTick(() => searchInputEl.value?.focus())
   }
 }
 
+function onMsgTextClick(e: MouseEvent) {
+  const el = (e.target as HTMLElement | null)?.closest?.('.msg-hashtag') as HTMLElement | null
+  if (!el) return
+  e.preventDefault()
+  const tag = el.getAttribute('data-tag') || ''
+  if (!tag) return
+  showSearch.value = true
+  searchInput.value = `#${tag}`
+  void chat.searchByHashtag(tag)
+}
+
+function selectHashtag(tag: string) {
+  searchHitIndex.value = -1
+  searchInput.value = `#${tag}`
+  void chat.searchByHashtag(tag)
+}
+
+function togglePinsPanel() {
+  showPins.value = !showPins.value
+  if (showPins.value) {
+    showSearch.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    void chat.loadPins()
+  }
+}
+
+function toggleBookmarksPanel() {
+  showBookmarks.value = !showBookmarks.value
+  if (showBookmarks.value) {
+    showSearch.value = false
+    showPins.value = false
+    showStars.value = false
+    bookmarkTitle.value = ''
+    bookmarkUrl.value = ''
+    void chat.loadBookmarks()
+  }
+}
+
+async function submitBookmark() {
+  const title = bookmarkTitle.value.trim()
+  const url = bookmarkUrl.value.trim()
+  if (!title || !url) return
+  await chat.addBookmark(title, url)
+  bookmarkTitle.value = ''
+  bookmarkUrl.value = ''
+}
+
+function toggleStarsPanel() {
+  showStars.value = !showStars.value
+  if (showStars.value) {
+    showSearch.value = false
+    showPins.value = false
+    showBookmarks.value = false
+    showSchedule.value = false
+    showReminders.value = false
+    void chat.loadStarred()
+  }
+}
+
+async function toggleSchedulePanel() {
+  showSchedule.value = !showSchedule.value
+  if (showSchedule.value) {
+    showSearch.value = false
+    showPins.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    showReminders.value = false
+    const min = new Date(Date.now() + 60_000)
+    scheduleAtLocal.value = toLocalInputValue(min)
+    scheduledItems.value = await chat.loadScheduled()
+  }
+}
+
+async function toggleRemindersPanel() {
+  showReminders.value = !showReminders.value
+  if (showReminders.value) {
+    showSearch.value = false
+    showPins.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    showSchedule.value = false
+    showMentions.value = false
+    showMedia.value = false
+    await chat.loadReminders()
+  }
+}
+
+async function toggleMediaPanel() {
+  showMedia.value = !showMedia.value
+  if (showMedia.value) {
+    showSearch.value = false
+    showPins.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    showSchedule.value = false
+    showReminders.value = false
+    showMentions.value = false
+    await chat.loadMedia(chat.mediaKind || 'all')
+  }
+}
+
+function remindIn(msg: { msg_id?: string | number; conversation_id?: string; msg_type?: number; content?: string }, minutes: number) {
+  const at = new Date(Date.now() + minutes * 60_000)
+  void chat.remindMessage(msg as any, at.toISOString())
+}
+
+function remindTomorrowMorning(msg: { msg_id?: string | number; conversation_id?: string; msg_type?: number; content?: string }) {
+  const at = new Date()
+  at.setDate(at.getDate() + 1)
+  at.setHours(9, 0, 0, 0)
+  if (at.getTime() - Date.now() < 30_000) {
+    at.setDate(at.getDate() + 1)
+  }
+  void chat.remindMessage(msg as any, at.toISOString())
+}
+
+async function jumpToReminder(item: {
+  conversation_id: string
+  msg_id: string
+  preview: string
+}) {
+  showReminders.value = false
+  const group = chat.groups.find((g) => g.conversation_id === item.conversation_id)
+  if (group) {
+    await chat.openGroup(group)
+    return
+  }
+  // direct conv id is often "d_{min}_{max}" — match friend via openDirect from sidebar list
+  const myId = idStr(auth.user?.id)
+  const friend = chat.friends.find((f) => directConvId(myId, f.id) === item.conversation_id)
+  if (friend) {
+    await chat.openDirect(friend)
+    return
+  }
+  chat.activeConvId = item.conversation_id
+  chat.activeGroupId = ''
+  await chat.loadHistory(item.conversation_id)
+}
+
+function toLocalInputValue(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+async function submitSchedule() {
+  const text = input.value.trim()
+  if (!text || !scheduleAtLocal.value || !chat.activeConvId) return
+  const sendAt = new Date(scheduleAtLocal.value)
+  if (Number.isNaN(sendAt.getTime())) {
+    chat.setError('时间无效')
+    return
+  }
+  await chat.scheduleMessage(text, sendAt.toISOString())
+  input.value = ''
+  saveDraft(chat.activeConvId, '')
+  scheduledItems.value = await chat.loadScheduled()
+}
+
+async function cancelScheduledItem(id: string) {
+  await chat.cancelScheduled(id)
+  scheduledItems.value = await chat.loadScheduled()
+}
+
+async function toggleMentionsPanel() {
+  showMentions.value = !showMentions.value
+  if (showMentions.value) {
+    showSearch.value = false
+    showPins.value = false
+    showBookmarks.value = false
+    showStars.value = false
+    showSchedule.value = false
+    await chat.loadMentions()
+  }
+}
+
+function togglePollComposer() {
+  showPollComposer.value = !showPollComposer.value
+  if (showPollComposer.value) {
+    pollQuestion.value = ''
+    pollOptions.value = ['', '']
+  }
+}
+
+function addPollOption() {
+  if (pollOptions.value.length >= 8) return
+  pollOptions.value = [...pollOptions.value, '']
+}
+
+async function submitPoll() {
+  await chat.sendPoll(pollQuestion.value, pollOptions.value)
+  showPollComposer.value = false
+  pollQuestion.value = ''
+  pollOptions.value = ['', '']
+}
+
+type PollContent = { question: string; options: { id: string; text: string }[] }
+
+function parsePoll(content: string): PollContent | null {
+  try {
+    const o = JSON.parse(content) as PollContent
+    if (o?.question && Array.isArray(o.options)) return o
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+function pollCount(msgId: string | number | undefined, optionId: string) {
+  const p = chat.pollFor(msgId)
+  return p?.counts.find((c) => c.option_id === optionId)?.count || 0
+}
+
+function pollPct(msgId: string | number | undefined, optionId: string) {
+  const p = chat.pollFor(msgId)
+  if (!p || !p.total) return 0
+  return Math.round((pollCount(msgId, optionId) / p.total) * 100)
+}
+
 function onSearchInput() {
   window.clearTimeout(searchDebounce)
+  searchHitIndex.value = -1
   searchDebounce = window.setTimeout(() => {
     void chat.searchMessages(searchInput.value)
   }, 300)
 }
 
 async function jumpToSearchResult(m: ChatMessage) {
+  const idx = chat.searchResults.findIndex((x) => x.client_msg_id === m.client_msg_id)
+  if (idx >= 0) searchHitIndex.value = idx
   skipAutoScroll.value = true
   try {
     await chat.jumpToMessage(m)
@@ -1273,14 +2054,39 @@ async function jumpToSearchResult(m: ChatMessage) {
   }
 }
 
+async function jumpSearchHit(delta: number) {
+  const list = chat.searchResults
+  if (!list.length) return
+  let next = searchHitIndex.value
+  if (next < 0) next = delta > 0 ? 0 : list.length - 1
+  else next = (next + delta + list.length) % list.length
+  searchHitIndex.value = next
+  await jumpToSearchResult(list[next])
+}
+
+const searchHitLabel = computed(() => {
+  const n = chat.searchResults.length
+  if (!n) return ''
+  const i = searchHitIndex.value
+  if (i < 0) return `${n} 条结果`
+  return `${i + 1} / ${n}`
+})
+
+async function jumpToPinned(m: ChatMessage) {
+  showPins.value = false
+  await jumpToSearchResult(m)
+}
+
 function senderLabel(m: ChatMessage) {
   if (sameId(m.from_user_id, auth.user?.id)) return '我'
+  if (chat.activeGroupId) {
+    return chat.groupMemberDisplayName(
+      m.from_user_id,
+      chat.activeGroupMembers.find((x) => sameId(x.id, m.from_user_id)),
+    )
+  }
   const friend = chat.friends.find((f) => sameId(f.id, m.from_user_id))
   if (friend) return friendDisplayName(friend)
-  if (chat.activeGroupId) {
-    const member = chat.activeGroupMembers.find((x) => sameId(x.id, m.from_user_id))
-    if (member) return chat.mentionName(member)
-  }
   return '对方'
 }
 
@@ -1399,9 +2205,34 @@ watch(
           v-model="filterQuery"
           class="input"
           type="search"
-          placeholder="搜索好友或群聊"
+          placeholder="搜索好友 / 群 / 聊天记录"
           aria-label="搜索会话"
+          @keydown.enter.prevent="runGlobalSearch"
         />
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm sidebar-search-btn"
+          :disabled="!filterQuery.trim() || chat.globalSearchLoading"
+          @click="runGlobalSearch"
+        >
+          {{ chat.globalSearchLoading ? '…' : '搜记录' }}
+        </button>
+      </div>
+      <div v-if="chat.globalSearchResults.length" class="global-search-panel">
+        <div class="global-search-head">
+          <span>聊天记录</span>
+          <button type="button" class="btn btn-ghost btn-sm" @click="chat.globalSearchResults = []">清除</button>
+        </div>
+        <button
+          v-for="m in chat.globalSearchResults"
+          :key="m.client_msg_id"
+          type="button"
+          class="global-search-item"
+          @click="openGlobalHit(m)"
+        >
+          <span class="gs-conv">{{ convTitleHint(m.conversation_id) }}</span>
+          <span class="gs-body">{{ previewMessage(m.content, m.msg_type) }}</span>
+        </button>
       </div>
 
       <div class="sidebar-tabs">
@@ -1432,6 +2263,56 @@ watch(
         >
           全读
         </button>
+      </div>
+
+      <div class="folder-bar" role="toolbar" aria-label="会话文件夹">
+        <button
+          type="button"
+          class="folder-chip"
+          :class="{ active: !chat.activeFolderId }"
+          @click="chat.activeFolderId = ''"
+        >
+          全部
+        </button>
+        <button
+          v-for="f in chat.folders"
+          :key="f.id"
+          type="button"
+          class="folder-chip"
+          :class="{ active: chat.activeFolderId === f.id }"
+          :title="`${f.name}（${f.conversation_ids.length}）`"
+          @click="chat.setActiveFolder(f.id)"
+        >
+          {{ f.name }}
+        </button>
+        <button
+          type="button"
+          class="folder-chip folder-chip-manage"
+          :aria-pressed="showFolderManage"
+          @click="showFolderManage = !showFolderManage"
+        >
+          管理
+        </button>
+      </div>
+      <div v-if="showFolderManage" class="folder-manage">
+        <div class="folder-manage-row">
+          <input
+            v-model="newFolderName"
+            class="input folder-manage-input"
+            maxlength="24"
+            placeholder="新文件夹名称"
+            @keydown.enter.prevent="submitNewFolder"
+          />
+          <button type="button" class="btn btn-primary btn-sm" :disabled="!newFolderName.trim()" @click="submitNewFolder">
+            新建
+          </button>
+        </div>
+        <ul v-if="chat.folders.length" class="folder-manage-list">
+          <li v-for="f in chat.folders" :key="f.id" class="folder-manage-item">
+            <span>{{ f.name }} · {{ f.conversation_ids.length }}</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="chat.deleteFolder(f.id)">删除</button>
+          </li>
+        </ul>
       </div>
 
       <div class="sidebar-list-pane" role="navigation" aria-label="会话列表">
@@ -1478,11 +2359,19 @@ watch(
         >
           <button type="button" class="avatar-btn" @click.stop="goProfile(f.id)">
             <UserAvatar :src="friendAvatarUrl(f)" :name="friendDisplayName(f)" :size="40" />
+            <span
+              class="online-dot"
+              :class="{ on: chat.isOnline(f.id) }"
+              :title="chat.isOnline(f.id) ? '在线' : '离线'"
+            />
           </button>
           <div class="friend-meta">
             <div class="friend-row-top">
               <span class="friend-name">{{ friendDisplayName(f) }}</span>
               <span v-if="isAgentProfile(f)" class="agent-badge" title="AI 助手">龟</span>
+              <span v-else-if="f.status_emoji || f.status_text" class="friend-status" :title="f.status_text || ''">
+                {{ f.status_emoji }}{{ f.status_text ? ` ${f.status_text}` : '' }}
+              </span>
               <time v-if="f.updatedAt" class="list-time">{{ formatListTime(f.updatedAt) }}</time>
             </div>
             <span v-if="draftPreview(directConvId(auth.user?.id || '', f.id))" class="friend-preview draft">
@@ -1638,6 +2527,16 @@ watch(
             v-if="chat.activeConvId"
             type="button"
             class="btn btn-ghost btn-sm"
+            aria-label="导出会话"
+            title="导出聊天记录为文本"
+            @click="chat.exportTranscript()"
+          >
+            导出
+          </button>
+          <button
+            v-if="chat.activeConvId"
+            type="button"
+            class="btn btn-ghost btn-sm"
             :aria-pressed="selectMode"
             aria-label="多选消息"
             @click="toggleSelectMode"
@@ -1655,6 +2554,72 @@ watch(
             {{ chat.isActiveMuted ? '已静音' : '免打扰' }}
           </button>
           <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showMentions"
+            aria-label="未读提及"
+            @click="toggleMentionsPanel"
+          >
+            @提及{{ chat.mentionInbox.length ? ` ${chat.mentionInbox.length}` : '' }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showStars"
+            aria-label="我的收藏"
+            @click="toggleStarsPanel"
+          >
+            收藏{{ chat.starredList.length ? ` ${chat.starredList.length}` : '' }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showSchedule"
+            aria-label="定时消息"
+            @click="toggleSchedulePanel"
+          >
+            定时
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showReminders"
+            aria-label="消息提醒"
+            @click="toggleRemindersPanel"
+          >
+            提醒{{ chat.reminderList.length ? ` ${chat.reminderList.length}` : '' }}
+          </button>
+          <button
+            v-if="chat.activeConvId"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showMedia"
+            aria-label="媒体库"
+            @click="toggleMediaPanel"
+          >
+            媒体
+          </button>
+          <button
+            v-if="chat.activeConvId"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showBookmarks"
+            aria-label="会话书签"
+            @click="toggleBookmarksPanel"
+          >
+            书签{{ chat.activeBookmarks().length ? ` ${chat.activeBookmarks().length}` : '' }}
+          </button>
+          <button
+            v-if="chat.activeConvId"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :aria-pressed="showPins"
+            aria-label="置顶消息"
+            @click="togglePinsPanel"
+          >
+            置顶{{ chat.activePins().length ? ` ${chat.activePins().length}` : '' }}
+          </button>
+          <button
             v-if="chat.activeConvId"
             type="button"
             class="btn btn-ghost btn-sm"
@@ -1663,6 +2628,15 @@ watch(
             @click="toggleSearch"
           >
             搜索
+          </button>
+          <button
+            v-if="chat.activeConvId && hasUnreadMarker"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            aria-label="跳到未读"
+            @click="jumpToFirstUnread(true)"
+          >
+            未读
           </button>
           <span v-if="chat.activeConvId" class="chat-status" :class="wsStatusClass">{{ wsStatusLabel }}</span>
         </div>
@@ -1676,22 +2650,310 @@ watch(
               v-model="searchInput"
               type="search"
               class="msg-search-input"
-              placeholder="搜索本会话消息…"
+              placeholder="搜索本会话消息，或点话题…"
               aria-label="搜索本会话消息"
               @input="onSearchInput"
             />
             <button type="button" class="btn btn-ghost btn-sm" @click="toggleSearch">关闭</button>
           </div>
+          <div v-if="chat.hashtagList.length" class="hashtag-chip-row">
+            <button
+              v-for="h in chat.hashtagList"
+              :key="h.tag"
+              type="button"
+              class="hashtag-chip"
+              :class="{ active: chat.activeHashtag === h.tag }"
+              @click="selectHashtag(h.tag)"
+            >
+              #{{ h.tag }} · {{ h.count }}
+            </button>
+          </div>
           <div v-if="chat.searchLoading" class="msg-search-hint">搜索中…</div>
           <div v-else-if="searchInput.trim() && !chat.searchResults.length" class="msg-search-hint">无匹配消息</div>
-          <ul v-else-if="chat.searchResults.length" class="msg-search-list">
-            <li v-for="m in chat.searchResults" :key="m.client_msg_id">
-              <button type="button" class="msg-search-item" @click="jumpToSearchResult(m)">
+          <template v-else-if="chat.searchResults.length">
+            <div class="search-nav-bar" role="toolbar" aria-label="搜索结果导航">
+              <span class="search-nav-label">{{ searchHitLabel }}</span>
+              <div class="search-nav-actions">
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  :disabled="!chat.searchResults.length"
+                  title="上一条 (Shift+F3)"
+                  @click="jumpSearchHit(-1)"
+                >
+                  上一条
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  :disabled="!chat.searchResults.length"
+                  title="下一条 (F3)"
+                  @click="jumpSearchHit(1)"
+                >
+                  下一条
+                </button>
+              </div>
+            </div>
+            <ul class="msg-search-list">
+              <li v-for="(m, i) in chat.searchResults" :key="m.client_msg_id">
+                <button
+                  type="button"
+                  class="msg-search-item"
+                  :class="{ active: searchHitIndex === i }"
+                  @click="jumpToSearchResult(m)"
+                >
+                  <span class="msg-search-meta">{{ senderLabel(m) }} · {{ formatMessageTime(m.created_at) }}</span>
+                  <span class="msg-search-snippet">{{ messageBody(m) || m.content }}</span>
+                </button>
+              </li>
+            </ul>
+          </template>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="chat.activeConvId && showPins" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">置顶消息（{{ chat.activePins().length }}）</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="togglePinsPanel">关闭</button>
+          </div>
+          <div v-if="!chat.activePins().length" class="msg-search-hint">暂无置顶，悬停消息点「置顶」</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="p in chat.activePins()" :key="p.message.client_msg_id || String(p.message.msg_id)">
+              <div class="pin-row">
+                <button type="button" class="msg-search-item" @click="jumpToPinned(p.message)">
+                  <span class="msg-search-meta">
+                    {{ senderLabel(p.message) }} · {{ formatMessageTime(p.message.created_at) }}
+                  </span>
+                  <span class="msg-search-snippet">{{ previewMessage(p.message.content, p.message.msg_type) }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm pin-unpin"
+                  title="取消置顶"
+                  @click="chat.togglePin(p.message)"
+                >
+                  取消
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="chat.activeConvId && showBookmarks" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">会话书签（{{ chat.activeBookmarks().length }}）</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleBookmarksPanel">关闭</button>
+          </div>
+          <div class="bookmark-form">
+            <input v-model="bookmarkTitle" class="msg-search-input" placeholder="标题" maxlength="64" />
+            <input
+              v-model="bookmarkUrl"
+              class="msg-search-input"
+              placeholder="https://…"
+              maxlength="1024"
+              @keydown.enter.prevent="submitBookmark"
+            />
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              :disabled="!bookmarkTitle.trim() || !bookmarkUrl.trim()"
+              @click="submitBookmark"
+            >
+              添加
+            </button>
+          </div>
+          <div v-if="!chat.activeBookmarks().length" class="msg-search-hint">添加常用文档、看板链接</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="b in chat.activeBookmarks()" :key="b.id">
+              <div class="pin-row">
+                <a class="msg-search-item bookmark-link" :href="b.url" target="_blank" rel="noopener">
+                  <span class="msg-search-meta">{{ b.title }}</span>
+                  <span class="msg-search-snippet">{{ b.url }}</span>
+                </a>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm pin-unpin"
+                  title="删除书签"
+                  @click="chat.deleteBookmark(b.id)"
+                >
+                  删除
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="showMentions" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">未读 @提及（{{ chat.mentionInbox.length }}）</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleMentionsPanel">关闭</button>
+          </div>
+          <div v-if="!chat.mentionInbox.length" class="msg-search-hint">暂无未读提及</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="m in chat.mentionInbox" :key="m.client_msg_id">
+              <button
+                type="button"
+                class="msg-search-item"
+                @click="showMentions = false; jumpToSearchResult(m)"
+              >
                 <span class="msg-search-meta">{{ senderLabel(m) }} · {{ formatMessageTime(m.created_at) }}</span>
-                <span class="msg-search-snippet">{{ messageBody(m) || m.content }}</span>
+                <span class="msg-search-snippet">{{ previewMessage(m.content, m.msg_type) }}</span>
               </button>
             </li>
           </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="showStars" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">我的收藏（{{ chat.starredList.length }}）</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleStarsPanel">关闭</button>
+          </div>
+          <div v-if="!chat.starredList.length" class="msg-search-hint">悬停消息点「收藏」保存稍后查看</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="s in chat.starredList" :key="String(s.message.msg_id || s.message.client_msg_id)">
+              <div class="pin-row">
+                <button type="button" class="msg-search-item" @click="jumpToSearchResult(s.message)">
+                  <span class="msg-search-meta">
+                    {{ senderLabel(s.message) }} · {{ formatMessageTime(s.message.created_at) }}
+                  </span>
+                  <span class="msg-search-snippet">{{ previewMessage(s.message.content, s.message.msg_type) }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm pin-unpin"
+                  @click="chat.toggleStar(s.message)"
+                >
+                  取消
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="chat.activeConvId && showSchedule" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">定时发送</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleSchedulePanel">关闭</button>
+          </div>
+          <div class="bookmark-form">
+            <input v-model="scheduleAtLocal" class="msg-search-input" type="datetime-local" />
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              :disabled="!input.trim() || !scheduleAtLocal"
+              @click="submitSchedule"
+            >
+              定时发送当前输入
+            </button>
+          </div>
+          <div v-if="!scheduledItems.length" class="msg-search-hint">输入内容后选择时间即可定时发出</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="item in scheduledItems" :key="item.id">
+              <div class="pin-row">
+                <div class="msg-search-item">
+                  <span class="msg-search-meta">{{ formatMessageTime(item.send_at) }}</span>
+                  <span class="msg-search-snippet">{{ item.content }}</span>
+                </div>
+                <button type="button" class="btn btn-ghost btn-sm pin-unpin" @click="cancelScheduledItem(item.id)">
+                  取消
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="showReminders" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">稍后提醒（{{ chat.reminderList.length }}）</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleRemindersPanel">关闭</button>
+          </div>
+          <div v-if="!chat.reminderList.length" class="msg-search-hint">悬停消息点「提醒」设置稍后处理</div>
+          <ul v-else class="msg-search-list">
+            <li v-for="item in chat.reminderList" :key="item.id">
+              <div class="pin-row">
+                <button type="button" class="msg-search-item" @click="jumpToReminder(item)">
+                  <span class="msg-search-meta">{{ formatMessageTime(item.remind_at) }}</span>
+                  <span class="msg-search-snippet">{{ item.preview || '消息提醒' }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm pin-unpin"
+                  @click="chat.cancelReminder(item.id)"
+                >
+                  取消
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </Transition>
+
+      <Transition name="panel-slide">
+        <div v-if="chat.activeConvId && showMedia" class="msg-search-panel pins-panel">
+          <div class="msg-search-bar">
+            <span class="pins-panel-title">媒体库</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="toggleMediaPanel">关闭</button>
+          </div>
+          <div class="hashtag-chip-row">
+            <button
+              v-for="k in [
+                { id: 'all', label: '全部' },
+                { id: 'image', label: '图片' },
+                { id: 'file', label: '文件' },
+                { id: 'voice', label: '语音' },
+              ]"
+              :key="k.id"
+              type="button"
+              class="hashtag-chip"
+              :class="{ active: chat.mediaKind === k.id }"
+              @click="chat.loadMedia(k.id)"
+            >
+              {{ k.label }}
+            </button>
+          </div>
+          <div v-if="chat.mediaLoading" class="msg-search-hint">加载中…</div>
+          <div v-else-if="!chat.mediaList.length" class="msg-search-hint">暂无媒体消息</div>
+          <div v-else class="media-gallery">
+            <template v-for="m in chat.mediaList" :key="m.client_msg_id || String(m.msg_id)">
+              <button
+                v-if="m.msg_type === 2 || parseFileContent(m.content)?.content_type?.startsWith('image/')"
+                type="button"
+                class="media-thumb"
+                @click="openImagePreview(parseFileContent(m.content)?.url || '')"
+              >
+                <img
+                  :src="fileUrl(parseFileContent(m.content)!.url)"
+                  alt=""
+                  loading="lazy"
+                />
+              </button>
+              <a
+                v-else-if="m.msg_type === 3 || parseFileContent(m.content)"
+                class="media-file-row"
+                :href="fileUrl(parseFileContent(m.content)!.url)"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <span class="media-file-name">{{ parseFileContent(m.content)?.filename || '文件' }}</span>
+                <span class="msg-search-meta">{{ formatMessageTime(m.created_at) }}</span>
+              </a>
+              <div v-else-if="m.msg_type === 5" class="media-file-row">
+                <span class="media-file-name">语音消息</span>
+                <span class="msg-search-meta">{{ formatMessageTime(m.created_at) }}</span>
+              </div>
+            </template>
+          </div>
         </div>
       </Transition>
 
@@ -1717,7 +2979,7 @@ watch(
 
       <Transition name="panel-slide">
         <div
-          v-if="chat.activeGroupId && chat.activeGroupNotice"
+          v-if="showGroupNoticeBar"
           class="group-notice-bar"
           role="status"
         >
@@ -1729,6 +2991,9 @@ watch(
             公告
           </span>
           <span class="group-notice-text">{{ chat.activeGroupNotice }}</span>
+          <button type="button" class="group-notice-dismiss" aria-label="关闭公告" @click="dismissActiveNotice">
+            ×
+          </button>
         </div>
       </Transition>
 
@@ -1800,6 +3065,8 @@ watch(
               v-if="item.kind === 'divider'"
               class="date-divider"
               :class="{ unread: item.variant === 'unread' }"
+              :id="item.variant === 'unread' ? 'unread-sep' : undefined"
+              :data-unread-sep="item.variant === 'unread' ? '1' : undefined"
             >
               <span>{{ item.label }}</span>
             </div>
@@ -1856,7 +3123,7 @@ watch(
                   {{ senderLabel(item.message) }}
                 </div>
                 <div
-                  v-if="!selectMode && (isTextMessage(item.message) || canRecall(item.message) || canReply(item.message))"
+                  v-if="!selectMode && (isTextMessage(item.message) || canRecall(item.message) || canEdit(item.message) || canReply(item.message) || item.message.msg_id)"
                   class="msg-actions msg-actions-desktop"
                 >
                   <button
@@ -1872,15 +3139,73 @@ watch(
                     @click="copyText(messageBody(item.message))"
                   >复制</button>
                   <button
+                    v-if="isTextMessage(item.message) && item.message.msg_id"
+                    type="button"
+                    class="msg-action-btn"
+                    :disabled="chat.translatingMsgId === idStr(item.message.msg_id)"
+                    @click="chat.translateMessage(item.message)"
+                  >{{ chat.translatingMsgId === idStr(item.message.msg_id) ? '翻译中…' : '翻译' }}</button>
+                  <button
                     v-if="canRecall(item.message)"
                     type="button"
                     class="msg-action-btn"
                     @click="recallMsg(item.message)"
                   >撤回</button>
+                  <button
+                    v-if="canEdit(item.message)"
+                    type="button"
+                    class="msg-action-btn"
+                    @click="startEdit(item.message)"
+                  >编辑</button>
+                  <button
+                    v-if="item.message.msg_id && item.message.msg_type !== 4"
+                    type="button"
+                    class="msg-action-btn"
+                    :class="{ active: chat.isStarred(item.message.msg_id) }"
+                    @click="chat.toggleStar(item.message)"
+                  >{{ chat.isStarred(item.message.msg_id) ? '已藏' : '收藏' }}</button>
+                  <button
+                    v-if="item.message.msg_id && item.message.msg_type !== 4"
+                    type="button"
+                    class="msg-action-btn"
+                    title="1 小时后提醒"
+                    @click="remindIn(item.message, 60)"
+                  >提醒</button>
+                  <button
+                    v-if="item.message.msg_id && item.message.msg_type !== 4"
+                    type="button"
+                    class="msg-action-btn"
+                    title="明天 9:00 提醒"
+                    @click="remindTomorrowMorning(item.message)"
+                  >明早</button>
+                  <button
+                    v-if="item.message.msg_id && item.message.msg_type !== 4"
+                    type="button"
+                    class="msg-action-btn"
+                    title="表情回应"
+                    @click="toggleReactPicker(item.message.client_msg_id)"
+                  >表情</button>
+                  <button
+                    v-if="item.message.msg_id && item.message.msg_type !== 4"
+                    type="button"
+                    class="msg-action-btn"
+                    :class="{ active: chat.isMsgPinned(item.message.msg_id) }"
+                    :title="chat.isMsgPinned(item.message.msg_id) ? '取消置顶' : '置顶'"
+                    @click="chat.togglePin(item.message)"
+                  >{{ chat.isMsgPinned(item.message.msg_id) ? '取消置顶' : '置顶' }}</button>
                 </div>
                 <template v-if="parseFileContent(item.message.content) || item.message.localPreview">
+                  <div v-if="item.message.msg_type === 5" class="voice-msg">
+                    <audio
+                      class="voice-audio"
+                      controls
+                      preload="metadata"
+                      :src="voiceMeta(item.message).url"
+                    />
+                    <span class="voice-dur">{{ voiceMeta(item.message).duration }}″</span>
+                  </div>
                   <div
-                    v-if="item.message.msg_type === 2 || item.message.localPreview || parseFileContent(item.message.content)?.content_type?.startsWith('image/')"
+                    v-else-if="item.message.msg_type === 2 || (item.message.localPreview && item.message.msg_type !== 5) || parseFileContent(item.message.content)?.content_type?.startsWith('image/')"
                     class="msg-image-wrap"
                   >
                     <img
@@ -1928,6 +3253,26 @@ watch(
                     v-if="item.message.msg_type === 4"
                     class="recalled"
                   >{{ item.message.content }}</span>
+                  <div v-else-if="item.message.msg_type === 6 && parsePoll(item.message.content)" class="poll-card">
+                    <div class="poll-q">{{ parsePoll(item.message.content)!.question }}</div>
+                    <button
+                      v-for="opt in parsePoll(item.message.content)!.options"
+                      :key="opt.id"
+                      type="button"
+                      class="poll-opt"
+                      :class="{ mine: chat.pollFor(item.message.msg_id)?.my_option_id === opt.id }"
+                      :disabled="!item.message.msg_id"
+                      @click="chat.votePoll(item.message, opt.id)"
+                    >
+                      <span class="poll-opt-text">{{ opt.text }}</span>
+                      <span class="poll-opt-meta">{{ pollCount(item.message.msg_id, opt.id) }} · {{ pollPct(item.message.msg_id, opt.id) }}%</span>
+                      <span
+                        class="poll-opt-bar"
+                        :style="{ width: `${pollPct(item.message.msg_id, opt.id)}%` }"
+                      />
+                    </button>
+                    <div class="poll-total">共 {{ chat.pollFor(item.message.msg_id)?.total || 0 }} 票</div>
+                  </div>
                   <template v-else>
                     <div
                       v-if="messageReply(item.message)"
@@ -1941,10 +3286,54 @@ watch(
                       <div class="msg-quote-name">{{ messageReply(item.message)!.n }}</div>
                       <div class="msg-quote-preview">{{ messageReply(item.message)!.p }}</div>
                     </div>
-                    <span
-                      class="msg-text"
-                      v-html="renderMessageHtml(item.message.content)"
-                    />
+                    <div v-if="editingMsgId === item.message.client_msg_id" class="msg-edit-box">
+                      <textarea
+                        v-model="editDraft"
+                        class="msg-edit-input"
+                        rows="3"
+                        @keydown.esc.prevent="cancelEdit"
+                        @keydown.enter.exact.prevent="saveEdit(item.message)"
+                      />
+                      <div class="msg-edit-actions">
+                        <button type="button" class="btn btn-ghost btn-sm" @click="cancelEdit">取消</button>
+                        <button
+                          type="button"
+                          class="btn btn-primary btn-sm"
+                          :disabled="!editDraft.trim()"
+                          @click="saveEdit(item.message)"
+                        >保存</button>
+                      </div>
+                    </div>
+                    <template v-else>
+                      <span
+                        class="msg-text"
+                        v-html="renderMessageHtml(item.message.content)"
+                        @click="onMsgTextClick"
+                      />
+                      <span v-if="item.message.edited_at" class="msg-edited" title="已编辑">已编辑</span>
+                      <div
+                        v-if="item.message.msg_id && chat.translationFor(item.message.msg_id)"
+                        class="msg-translation"
+                      >
+                        <div class="msg-translation-label">
+                          翻译
+                          <button
+                            type="button"
+                            class="msg-translation-clear"
+                            @click="chat.clearTranslation(item.message.msg_id)"
+                          >
+                            关闭
+                          </button>
+                        </div>
+                        <div class="msg-translation-text">
+                          {{ chat.translationFor(item.message.msg_id)!.text }}
+                        </div>
+                      </div>
+                      <LinkPreviewCard
+                        v-if="messageLink(item.message)"
+                        :url="messageLink(item.message)!"
+                      />
+                    </template>
                   </template>
                 </template>
                 <time
@@ -1975,8 +3364,23 @@ watch(
                     <path d="M8.5 12.5l4 4L20.5 7.5" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
                 </span>
+                <button
+                  v-else-if="
+                    chat.activeGroupId &&
+                    item.showTime &&
+                    sameId(item.message.from_user_id, auth.user?.id) &&
+                    item.message.seq &&
+                    chat.groupPeerCount(chat.activeConvId) > 0
+                  "
+                  type="button"
+                  class="group-read-btn"
+                  :title="`已读 ${chat.groupReadCount(chat.activeConvId, item.message.seq)}/${chat.groupPeerCount(chat.activeConvId)}`"
+                  @click.stop="toggleGroupReadPopup(item.message.client_msg_id)"
+                >
+                  已读 {{ chat.groupReadCount(chat.activeConvId, item.message.seq) }}
+                </button>
                 <span
-                  v-else-if="item.showTime && sameId(item.message.from_user_id, auth.user?.id) && item.message.status !== 'failed'"
+                  v-else-if="item.showTime && sameId(item.message.from_user_id, auth.user?.id) && item.message.status !== 'failed' && !chat.activeGroupId"
                   class="read-tag sent"
                   title="已发送"
                   aria-label="已发送"
@@ -1999,19 +3403,109 @@ watch(
                   </svg>
                   <span>重试</span>
                 </button>
+                <div
+                  v-if="groupReadPopupFor === item.message.client_msg_id"
+                  class="group-read-popup"
+                  @click.stop
+                >
+                  <p class="group-read-title">
+                    已读 {{ chat.groupReadCount(chat.activeConvId, item.message.seq) }}/{{ chat.groupPeerCount(chat.activeConvId) }}
+                  </p>
+                  <div
+                    v-if="chat.groupReadMembers(chat.activeConvId, item.message.seq).length"
+                    class="group-read-grid"
+                  >
+                    <button
+                      v-for="m in chat.groupReadMembers(chat.activeConvId, item.message.seq)"
+                      :key="m.user_id"
+                      type="button"
+                      class="group-read-person"
+                      :title="groupReadName(m.user_id)"
+                      @click="openGroupReadProfile(m.user_id)"
+                    >
+                      <UserAvatar
+                        :src="groupReadAvatar(m.user_id)"
+                        :name="groupReadName(m.user_id)"
+                        :size="28"
+                      />
+                      <span class="group-read-person-name">{{ groupReadName(m.user_id) }}</span>
+                    </button>
+                  </div>
+                  <p v-else class="group-read-empty">暂无人已读</p>
+                  <template v-if="chat.groupUnreadMembers(chat.activeConvId, item.message.seq).length">
+                    <p class="group-read-title group-read-title-unread">未读</p>
+                    <div class="group-read-grid">
+                      <button
+                        v-for="m in chat.groupUnreadMembers(chat.activeConvId, item.message.seq)"
+                        :key="`u-${m.user_id}`"
+                        type="button"
+                        class="group-read-person dim"
+                        :title="groupReadName(m.user_id)"
+                        @click="openGroupReadProfile(m.user_id)"
+                      >
+                        <UserAvatar
+                          :src="groupReadAvatar(m.user_id)"
+                          :name="groupReadName(m.user_id)"
+                          :size="28"
+                        />
+                        <span class="group-read-person-name">{{ groupReadName(m.user_id) }}</span>
+                      </button>
+                    </div>
+                  </template>
+                </div>
+                <div
+                  v-if="reactPickerFor === item.message.client_msg_id"
+                  class="react-picker"
+                  @click.stop
+                >
+                  <button
+                    v-for="em in REACTION_EMOJIS"
+                    :key="em"
+                    type="button"
+                    class="react-pick-btn"
+                    @click="onPickReaction(item.message, em)"
+                  >{{ em }}</button>
+                </div>
+                <div
+                  v-if="chat.reactionsFor(item.message.msg_id).length"
+                  class="react-strip"
+                  @click.stop
+                >
+                  <button
+                    v-for="r in chat.reactionsFor(item.message.msg_id)"
+                    :key="r.emoji"
+                    type="button"
+                    class="react-chip"
+                    :class="{ mine: r.mine }"
+                    @click="chat.toggleReaction(item.message, r.emoji)"
+                  >
+                    <span>{{ r.emoji }}</span>
+                    <span class="react-count">{{ r.count }}</span>
+                  </button>
+                </div>
               </div>
             </div>
           </template>
         </div>
         <Transition name="fab">
-          <button
-            v-if="!nearBottom"
-            type="button"
-            class="jump-latest-btn"
-            @click="jumpToLatest"
-          >
-            {{ pendingNewCount > 0 ? `${pendingNewCount > 99 ? '99+' : pendingNewCount} 条新消息` : '回到底部' }}
-          </button>
+          <div v-if="!nearBottom || hasUnreadMarker" class="jump-fabs">
+            <button
+              v-if="hasUnreadMarker"
+              type="button"
+              class="jump-latest-btn jump-unread-btn"
+              @click="jumpToFirstUnread(true)"
+            >
+              跳到未读
+            </button>
+            <button
+              v-if="!nearBottom"
+              type="button"
+              class="jump-latest-btn"
+              @click="jumpToLatest"
+            >
+              {{ pendingNewCount > 0 ? `${pendingNewCount > 99 ? '99+' : pendingNewCount} 条新消息` : '回到底部' }}
+            </button>
+          </div>
         </Transition>
         </div>
         <div class="composer-stack">
@@ -2019,13 +3513,40 @@ watch(
             <div v-if="selectMode" class="select-bar" role="toolbar" aria-label="多选操作">
               <span>已选 {{ selectedCount }} 条</span>
               <div class="select-bar-actions">
+                <button type="button" class="btn btn-ghost btn-sm" @click="selectAllVisibleMessages">
+                  全选
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  :disabled="!selectedCount"
+                  @click="clearSelectedMessages"
+                >
+                  清空
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  :disabled="!selectedStarrableCount"
+                  @click="starSelectedMessages"
+                >
+                  收藏
+                </button>
                 <button
                   type="button"
                   class="btn btn-primary btn-sm"
                   :disabled="!selectedCount"
+                  @click="openForwardPicker"
+                >
+                  转发
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  :disabled="!selectedCount"
                   @click="copySelectedMessages"
                 >
-                  复制转发文本
+                  复制
                 </button>
                 <button type="button" class="btn btn-secondary btn-sm" @click="toggleSelectMode">完成</button>
               </div>
@@ -2040,7 +3561,22 @@ watch(
             </div>
           </Transition>
           <Transition name="stack">
-            <div v-if="mentionOpen && mentionCandidates.length" class="mention-panel" role="listbox">
+            <div
+              v-if="mentionOpen && (mentionShowAll || mentionCandidates.length)"
+              class="mention-panel"
+              role="listbox"
+            >
+              <button
+                v-if="mentionShowAll"
+                type="button"
+                class="mention-item mention-all"
+                role="option"
+                @mousedown.prevent="insertMentionAll"
+              >
+                <span class="mention-all-icon" aria-hidden="true">＠</span>
+                <span class="mention-name">所有人</span>
+                <span class="mention-user">通知群内全部成员</span>
+              </button>
               <button
                 v-for="m in mentionCandidates"
                 :key="m.id"
@@ -2066,6 +3602,34 @@ watch(
                 <div class="upload-banner-bar">
                   <div class="upload-banner-fill" :style="{ width: `${chat.uploadPercent}%` }" />
                 </div>
+              </div>
+            </div>
+          </Transition>
+          <Transition name="stack">
+            <div v-if="showPollComposer" class="poll-composer" role="dialog" aria-label="发起投票">
+              <input v-model="pollQuestion" class="input" type="text" maxlength="120" placeholder="投票问题" />
+              <input
+                v-for="(_, i) in pollOptions"
+                :key="i"
+                v-model="pollOptions[i]"
+                class="input"
+                type="text"
+                maxlength="64"
+                :placeholder="`选项 ${i + 1}`"
+              />
+              <div class="poll-composer-actions">
+                <button type="button" class="btn btn-ghost btn-sm" :disabled="pollOptions.length >= 8" @click="addPollOption">
+                  加选项
+                </button>
+                <button type="button" class="btn btn-ghost btn-sm" @click="showPollComposer = false">取消</button>
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  :disabled="!pollQuestion.trim() || pollOptions.filter((t) => t.trim()).length < 2"
+                  @click="submitPoll"
+                >
+                  发送投票
+                </button>
               </div>
             </div>
           </Transition>
@@ -2118,19 +3682,61 @@ watch(
             type="button"
             class="btn btn-secondary btn-sm composer-icon-btn"
             aria-label="发送文件"
-            :disabled="chat.uploading"
+            :disabled="chat.uploading || recording"
             @click="pickFile"
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
               <path d="M21.4 11.6l-8.5 8.5a5 5 0 01-7.1-7.1l8.5-8.5a3.2 3.2 0 014.5 4.5L10.2 17.6a1.4 1.4 0 01-2-2l7.4-7.4" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </button>
+          <button
+            v-if="!recording"
+            type="button"
+            class="btn btn-secondary btn-sm composer-icon-btn"
+            aria-label="按住说话"
+            title="点击开始录音，最长 60 秒"
+            :disabled="chat.uploading || !chat.activeConvId"
+            @click="startVoiceRecord"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <rect x="9" y="2" width="6" height="12" rx="3" />
+              <path d="M5 11a7 7 0 0014 0M12 18v3" stroke-linecap="round" />
+            </svg>
+          </button>
+          <button
+            v-if="!recording"
+            type="button"
+            class="btn btn-secondary btn-sm composer-icon-btn"
+            aria-label="发起投票"
+            title="发起投票"
+            :aria-pressed="showPollComposer"
+            :disabled="chat.uploading || !chat.activeConvId"
+            @click="togglePollComposer"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <path d="M4 19V5M4 19h16M8 15v-4M12 15V8M16 15v-6" stroke-linecap="round" />
+            </svg>
+          </button>
+          <div v-else class="voice-rec-bar">
+            <span class="voice-rec-dot" aria-hidden="true" />
+            <span>录音中 {{ recordSecs }}s</span>
+            <button type="button" class="btn btn-ghost btn-sm" @click="cancelVoiceRecord">取消</button>
+            <button type="button" class="btn btn-primary btn-sm" @click="stopVoiceRecord">发送</button>
+          </div>
           <textarea
+            v-show="!recording"
             ref="composerInputEl"
             v-model="input"
             class="input composer-input"
             rows="1"
-            :placeholder="chat.activeGroupId ? '发消息… Enter 发送，Shift+Enter 换行' : '发消息… Enter 发送，Shift+Enter 换行'"
+            :placeholder="
+              chat.activeGroupId && !chat.canPostInActiveGroup
+                ? chat.activeGroupPostBlockReason
+                : chat.activeGroupId
+                  ? '发消息… Enter 发送，Shift+Enter 换行'
+                  : '发消息… Enter 发送，Shift+Enter 换行'
+            "
+            :disabled="!!chat.activeGroupId && !chat.canPostInActiveGroup"
             aria-label="消息输入框"
             @input="onComposerInput"
             @keyup="updateMentionState"
@@ -2139,10 +3745,11 @@ watch(
             @paste="onComposerPaste"
           />
           <button
+            v-show="!recording"
             type="button"
             class="btn btn-primary send-btn"
             :class="{ sending: sendingLock }"
-            :disabled="!input.trim() || chat.uploading || sendingLock"
+            :disabled="!input.trim() || chat.uploading || sendingLock || (!!chat.activeGroupId && !chat.canPostInActiveGroup)"
             :aria-busy="sendingLock"
             @click="send"
           >
@@ -2165,6 +3772,53 @@ watch(
         </footer>
       </template>
     </main>
+
+    <Teleport to="body">
+      <Transition name="fade">
+        <div v-if="forwardOpen" class="forward-overlay" @click.self="closeForwardPicker">
+          <div class="forward-card" role="dialog" aria-modal="true" aria-label="选择转发对象">
+            <header class="forward-head">
+              <h3>转发给</h3>
+              <button type="button" class="btn btn-ghost btn-sm" @click="closeForwardPicker">关闭</button>
+            </header>
+            <input
+              v-model="forwardQuery"
+              class="input forward-search"
+              type="search"
+              placeholder="搜索好友或群聊"
+            />
+            <div class="forward-list">
+              <p class="forward-label">好友</p>
+              <button
+                v-for="f in forwardFriends"
+                :key="'f-' + f.id"
+                type="button"
+                class="forward-item"
+                :disabled="forwarding"
+                @click="forwardToFriend(f)"
+              >
+                <UserAvatar :src="friendAvatarUrl(f)" :name="friendDisplayName(f)" :size="36" />
+                <span>{{ friendDisplayName(f) }}</span>
+              </button>
+              <p v-if="!forwardFriends.length" class="forward-empty">无匹配好友</p>
+              <p class="forward-label">群聊</p>
+              <button
+                v-for="g in forwardGroups"
+                :key="'g-' + g.id"
+                type="button"
+                class="forward-item"
+                :disabled="forwarding"
+                @click="forwardToGroup(g)"
+              >
+                <UserAvatar :name="g.name" :size="36" />
+                <span>{{ g.name }}</span>
+              </button>
+              <p v-if="!forwardGroups.length" class="forward-empty">无匹配群聊</p>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <Transition name="fade">
       <AddContactModal v-if="showAddModal" @close="showAddModal = false" />
@@ -2196,6 +3850,13 @@ watch(
           role="menuitem"
           @click="msgMenuCopy()"
         >复制</button>
+        <button
+          v-if="isTextMessage(msgMenu.message) && msgMenu.message.msg_id"
+          type="button"
+          class="ctx-item"
+          role="menuitem"
+          @click="msgMenuTranslate()"
+        >翻译</button>
         <button
           v-if="canRecall(msgMenu.message)"
           type="button"
@@ -2238,9 +3899,59 @@ watch(
           }}
         </template>
       </button>
+      <template v-if="chat.folders.length">
+        <div class="ctx-sep" role="separator" />
+        <button
+          v-for="f in chat.folders"
+          :key="f.id"
+          type="button"
+          class="ctx-item"
+          role="menuitem"
+          @click="ctxAssignFolder(f.id)"
+        >
+          移入「{{ f.name }}」
+        </button>
+        <button type="button" class="ctx-item" role="menuitem" @click="ctxRemoveFromFolders">移出文件夹</button>
+      </template>
       <button type="button" class="ctx-item" role="menuitem" @click="ctxOpenProfile">
         {{ ctxMenu.kind === 'friend' ? '查看资料' : '群聊信息' }}
       </button>
+      </div>
+    </Transition>
+
+    <Transition name="fade">
+      <div
+        v-if="draftConflict"
+        class="confirm-backdrop"
+        role="presentation"
+      >
+        <div class="confirm-card draft-conflict-card" role="dialog" aria-modal="true" aria-label="草稿冲突">
+          <h3 class="confirm-title">草稿冲突</h3>
+          <p class="confirm-body">
+            「{{ draftConflictTitle(draftConflict.convId) }}」的本地与云端草稿不一致，请选择保留哪一版。
+            <span v-if="draftConflict.rest.length" class="draft-conflict-rest">
+              （还有 {{ draftConflict.rest.length }} 处待处理）
+            </span>
+          </p>
+          <div class="draft-conflict-cols">
+            <div class="draft-conflict-col">
+              <div class="draft-conflict-label">本地</div>
+              <p class="draft-conflict-snippet">{{ previewDraftSnippet(draftConflict.local) }}</p>
+            </div>
+            <div class="draft-conflict-col">
+              <div class="draft-conflict-label">云端</div>
+              <p class="draft-conflict-snippet">{{ previewDraftSnippet(draftConflict.remote) }}</p>
+            </div>
+          </div>
+          <div class="confirm-actions">
+            <button type="button" class="btn btn-secondary btn-sm" @click="applyDraftConflict('cloud')">
+              使用云端
+            </button>
+            <button type="button" class="btn btn-primary btn-sm" @click="applyDraftConflict('local')">
+              保留本地
+            </button>
+          </div>
+        </div>
       </div>
     </Transition>
 
@@ -2404,10 +4115,68 @@ watch(
 .sidebar-search {
   flex-shrink: 0;
   padding: var(--space-3) var(--space-4) 0;
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 
 .sidebar-search .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-search-btn {
+  flex-shrink: 0;
+}
+
+.global-search-panel {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: var(--space-2) var(--space-4) 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-surface);
+  flex-shrink: 0;
+}
+
+.global-search-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.global-search-item {
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 8px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.global-search-item:hover {
+  background: var(--color-bg-sidebar);
+}
+
+.gs-conv {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gs-body {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .date-divider {
@@ -2459,6 +4228,76 @@ watch(
   padding: var(--space-1);
   background: var(--color-bg-sidebar);
   border-radius: var(--radius-md);
+}
+
+.folder-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: var(--space-2) var(--space-4) 0;
+  flex-shrink: 0;
+}
+
+.folder-chip {
+  border: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm, 6px);
+  cursor: pointer;
+  max-width: 7.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-chip.active {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+}
+
+.folder-chip-manage {
+  margin-left: auto;
+}
+
+.folder-manage {
+  margin: var(--space-2) var(--space-4) 0;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 6px);
+  flex-shrink: 0;
+}
+
+.folder-manage-row {
+  display: flex;
+  gap: 6px;
+}
+
+.folder-manage-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
+.folder-manage-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.folder-manage-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
 }
 
 .mark-all-btn {
@@ -2629,6 +4468,12 @@ watch(
   color: var(--color-text);
 }
 
+.ctx-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--color-border);
+}
+
 .ctx-item:hover {
   background: var(--color-primary-muted);
 }
@@ -2708,8 +4553,28 @@ watch(
 }
 
 .avatar-btn {
+  position: relative;
+  border: none;
+  background: transparent;
   padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.online-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
+  background: #94a3b8;
+  border: 2px solid var(--color-bg-surface);
+  box-sizing: border-box;
+}
+
+.online-dot.on {
+  background: #22c55e;
 }
 
 .friend-row-top {
@@ -2740,6 +4605,90 @@ watch(
   color: var(--color-text-muted);
 }
 
+.group-read-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
+  margin-left: 4px;
+}
+
+.group-read-btn:hover {
+  color: var(--color-primary);
+}
+
+.group-read-popup {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% - 4px);
+  z-index: 6;
+  min-width: 168px;
+  max-width: 240px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 10px;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+}
+
+.group-read-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.group-read-title-unread {
+  margin-top: 10px;
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.group-read-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.group-read-person {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+
+.group-read-person:hover {
+  background: var(--color-primary-muted, color-mix(in srgb, var(--color-primary) 12%, transparent));
+}
+
+.group-read-person.dim {
+  opacity: 0.72;
+}
+
+.group-read-person-name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.group-read-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
 .read-tag.pending {
   color: var(--color-text-muted);
   opacity: 0.75;
@@ -2758,6 +4707,16 @@ watch(
   font-size: var(--text-sm);
   font-weight: 500;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.friend-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--color-text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2960,6 +4919,46 @@ watch(
   background: var(--color-bg-surface);
 }
 
+.pins-panel-title {
+  flex: 1;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.pin-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.pin-row .msg-search-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.pin-unpin {
+  flex-shrink: 0;
+  align-self: center;
+  margin-right: var(--space-4);
+}
+
+.bookmark-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 0 var(--space-6) var(--space-3);
+}
+
+.bookmark-form .msg-search-input {
+  flex: 1 1 140px;
+}
+
+.bookmark-link {
+  text-decoration: none;
+  color: inherit;
+}
+
 .msg-search-bar {
   display: flex;
   align-items: center;
@@ -3007,6 +5006,29 @@ watch(
 
 .msg-search-item:hover {
   background: var(--color-primary-muted);
+}
+
+.msg-search-item.active {
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+}
+
+.search-nav-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 var(--space-6) var(--space-2);
+}
+
+.search-nav-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+
+.search-nav-actions {
+  display: flex;
+  gap: 4px;
 }
 
 .msg-search-meta {
@@ -3147,6 +5169,22 @@ watch(
   text-overflow: ellipsis;
 }
 
+.group-notice-dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #0f766e;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  opacity: 0.7;
+}
+
+.group-notice-dismiss:hover {
+  opacity: 1;
+}
+
 .load-more-btn {
   align-self: center;
   margin-bottom: var(--space-2);
@@ -3275,11 +5313,18 @@ watch(
   border-bottom-right-radius: var(--space-1);
 }
 
-.jump-latest-btn {
+.jump-fabs {
   position: absolute;
   right: var(--space-6);
   bottom: var(--space-4);
   z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.jump-latest-btn {
   padding: 8px 14px;
   font-size: var(--text-xs);
   font-weight: 600;
@@ -3289,6 +5334,13 @@ watch(
   border-radius: var(--radius-full);
   box-shadow: 0 4px 12px rgba(13, 148, 136, 0.35);
   cursor: pointer;
+}
+
+.jump-unread-btn {
+  background: var(--color-bg-surface);
+  color: var(--color-primary);
+  border: 1px solid var(--color-primary);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.1);
 }
 
 .jump-latest-btn:hover {
@@ -3355,6 +5407,7 @@ watch(
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: var(--space-3);
   padding: var(--space-2) var(--space-6);
   font-size: var(--text-sm);
@@ -3365,7 +5418,9 @@ watch(
 
 .select-bar-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
+  justify-content: flex-end;
 }
 
 .local-empty {
@@ -3543,6 +5598,75 @@ watch(
   border-radius: var(--radius-sm);
 }
 
+.msg-action-btn.active {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.msg-edited {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.msg-translation {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.msg-translation-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.msg-translation-clear {
+  border: none;
+  background: transparent;
+  color: var(--color-primary);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.msg-translation-text {
+  color: var(--color-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg-edit-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 200px;
+}
+
+.msg-edit-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font: inherit;
+  background: var(--color-bg-chat);
+}
+
+.msg-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .recalled {
   color: var(--color-text-muted);
   font-style: italic;
@@ -3634,6 +5758,20 @@ watch(
   background: var(--color-primary-muted);
 }
 
+.mention-all-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(13, 148, 136, 0.15);
+  color: #0f766e;
+  font-size: 14px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
 .mention-name {
   font-size: var(--text-sm);
   font-weight: 500;
@@ -3649,6 +5787,22 @@ watch(
   font-weight: 600;
 }
 
+:deep(.msg-text .msg-hashtag) {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+:deep(.msg-text .msg-hashtag:hover) {
+  text-decoration: underline;
+}
+
 :deep(.msg-text .msg-link) {
   color: var(--color-primary);
   text-decoration: underline;
@@ -3657,6 +5811,76 @@ watch(
 
 :deep(.msg-text .msg-link:hover) {
   opacity: 0.85;
+}
+
+.hashtag-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.hashtag-chip {
+  border: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm, 6px);
+  cursor: pointer;
+}
+
+.hashtag-chip.active {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+}
+
+.media-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 8px;
+  padding: 0 12px 12px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.media-thumb {
+  aspect-ratio: 1;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 6px);
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--color-bg-sidebar);
+}
+
+.media-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.media-file-row {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 6px);
+  text-decoration: none;
+  color: inherit;
+  font-size: 13px;
+}
+
+.media-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .composer {
@@ -3680,6 +5904,139 @@ watch(
 .composer-icon-btn[aria-pressed='true'] {
   color: var(--color-primary);
   background: var(--color-primary-muted);
+}
+
+.voice-rec-bar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  color: #b91c1c;
+}
+
+.voice-rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  animation: voice-pulse 1s ease infinite;
+}
+
+@keyframes voice-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.voice-msg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 160px;
+}
+
+.voice-audio {
+  width: 180px;
+  max-width: 100%;
+  height: 32px;
+}
+
+.voice-dur {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.poll-card {
+  min-width: 220px;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.poll-q {
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.poll-opt {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, transparent);
+  cursor: pointer;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.poll-opt:hover:not(:disabled) {
+  border-color: var(--color-primary, #3b82f6);
+}
+
+.poll-opt.mine {
+  border-color: var(--color-primary, #3b82f6);
+  background: color-mix(in srgb, var(--color-primary, #3b82f6) 12%, transparent);
+}
+
+.poll-opt-text {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-width: 0;
+}
+
+.poll-opt-meta {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.poll-opt-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--color-primary, #3b82f6) 18%, transparent);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.poll-total {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.poll-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-elevated, var(--color-surface));
+}
+
+.poll-composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 .send-btn {
@@ -4051,6 +6408,143 @@ watch(
   transform: translateY(10px) scale(0.96);
 }
 
+.react-picker {
+  display: flex;
+  gap: 2px;
+  margin-top: 4px;
+  padding: 4px;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  width: fit-content;
+}
+
+.react-pick-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.react-pick-btn:hover {
+  background: var(--color-bg-sidebar);
+}
+
+.react-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.react-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.react-chip.mine {
+  border-color: #0d9488;
+  background: rgba(13, 148, 136, 0.1);
+}
+
+.react-count {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.forward-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1250;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.forward-card {
+  width: 100%;
+  max-width: 400px;
+  max-height: min(72vh, 560px);
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg, 0 16px 40px rgba(15, 23, 42, 0.18));
+  overflow: hidden;
+}
+
+.forward-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.forward-head h3 {
+  margin: 0;
+  font-size: var(--text-base);
+}
+
+.forward-search {
+  margin: 10px 14px 0;
+  width: auto;
+}
+
+.forward-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 8px 14px;
+}
+
+.forward-label {
+  margin: 10px 8px 4px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.forward-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  background: transparent;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+}
+
+.forward-item:hover:not(:disabled) {
+  background: var(--color-bg-sidebar);
+}
+
+.forward-item:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.forward-empty {
+  margin: 4px 8px 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
 .confirm-backdrop {
   position: fixed;
   inset: 0;
@@ -4100,6 +6594,47 @@ watch(
   display: flex;
   justify-content: flex-end;
   gap: var(--space-2);
+}
+
+.draft-conflict-card {
+  max-width: 420px;
+}
+
+.draft-conflict-rest {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.draft-conflict-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0 0 var(--space-4);
+}
+
+.draft-conflict-col {
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-sidebar, rgba(15, 23, 42, 0.03));
+  min-width: 0;
+}
+
+.draft-conflict-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  margin-bottom: 4px;
+}
+
+.draft-conflict-snippet {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+  color: var(--color-text);
 }
 
 .tab-fade-enter-active,

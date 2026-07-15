@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +20,15 @@ type FriendService struct {
 	friend *store.FriendStore
 	users  *store.UserStore
 	idgen  *idgen.Generator
+	msgs   *MessageService
 }
 
 func NewFriendService(friend *store.FriendStore, users *store.UserStore, gen *idgen.Generator) *FriendService {
 	return &FriendService{friend: friend, users: users, idgen: gen}
+}
+
+func (s *FriendService) SetMessageService(msgs *MessageService) {
+	s.msgs = msgs
 }
 
 func (s *FriendService) Request(ctx context.Context, from, to int64, message string) error {
@@ -185,6 +192,7 @@ func (s *FriendService) JoinFaceToFace(ctx context.Context, userID int64, code s
 	if err := s.friend.AddGroupMember(ctx, sess.GroupID, userID); err != nil {
 		return nil, err
 	}
+	s.announceMemberJoined(ctx, sess.GroupID, userID)
 	g, _, err := s.friend.GetGroup(ctx, sess.GroupID)
 	if err != nil {
 		return map[string]interface{}{"status": "ok"}, nil
@@ -330,12 +338,14 @@ func (s *FriendService) ListGroupInvitations(ctx context.Context, userID int64) 
 }
 
 func (s *FriendService) AcceptGroupInvitation(ctx context.Context, inviteID, userID int64) error {
-	if err := s.friend.AcceptGroupInvitation(ctx, inviteID, userID); err != nil {
+	groupID, err := s.friend.AcceptGroupInvitation(ctx, inviteID, userID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return errBadRequest("群邀请不存在或已处理")
 		}
 		return err
 	}
+	s.announceMemberJoined(ctx, groupID, userID)
 	return nil
 }
 
@@ -497,9 +507,24 @@ func (s *FriendService) GetGroup(ctx context.Context, groupID, userID int64) (ma
 	}
 	memberProfiles := make([]model.PublicProfile, 0, len(members))
 	memberRoles := make(map[string]int)
+	memberMuted := make(map[string]bool)
+	memberNicknames := make(map[string]string)
+	memberRemarks := make(map[string]string)
 	roleRows, _ := s.friend.ListGroupMemberRoles(ctx, groupID)
 	for _, r := range roleRows {
-		memberRoles[strconv.FormatInt(r.UserID, 10)] = r.Role
+		uid := strconv.FormatInt(r.UserID, 10)
+		memberRoles[uid] = r.Role
+		if r.Muted {
+			memberMuted[uid] = true
+		}
+		if n := strings.TrimSpace(r.Nickname); n != "" {
+			memberNicknames[uid] = n
+		}
+	}
+	if remaps, rerr := s.friend.ListGroupMemberRemarks(ctx, userID, groupID); rerr == nil {
+		for tid, remark := range remaps {
+			memberRemarks[strconv.FormatInt(tid, 10)] = remark
+		}
 	}
 	for _, mid := range members {
 		u, err := s.users.GetByID(ctx, mid)
@@ -509,16 +534,114 @@ func (s *FriendService) GetGroup(ctx context.Context, groupID, userID int64) (ma
 		memberProfiles = append(memberProfiles, u.ApplyPrivacy(userID == mid))
 	}
 	return map[string]interface{}{
-		"id":              strconv.FormatInt(g.ID, 10),
-		"name":            g.Name,
-		"group_no":        g.GroupNo,
-		"owner_id":        strconv.FormatInt(g.OwnerID, 10),
-		"conversation_id": g.ConversationID,
-		"notice":          g.Notice,
-		"member_ids":      memberStrs,
-		"member_roles":    memberRoles,
-		"members":         memberProfiles,
+		"id":               strconv.FormatInt(g.ID, 10),
+		"name":             g.Name,
+		"group_no":         g.GroupNo,
+		"owner_id":         strconv.FormatInt(g.OwnerID, 10),
+		"conversation_id":  g.ConversationID,
+		"notice":           g.Notice,
+		"welcome_text":     g.WelcomeText,
+		"admin_only":       g.AdminOnly,
+		"slow_mode_secs":   g.SlowModeSecs,
+		"member_ids":       memberStrs,
+		"member_roles":     memberRoles,
+		"member_muted":     memberMuted,
+		"member_nicknames": memberNicknames,
+		"member_remarks":   memberRemarks,
+		"members":          memberProfiles,
 	}, nil
+}
+
+func (s *FriendService) SetGroupMemberRemark(ctx context.Context, groupID, viewerID, targetID int64, remark string) error {
+	ok, err := s.friend.IsGroupMember(ctx, groupID, viewerID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errBadRequest("您不在该群中")
+	}
+	tok, err := s.friend.IsGroupMember(ctx, groupID, targetID)
+	if err != nil {
+		return err
+	}
+	if !tok {
+		return errBadRequest("目标用户不在群中")
+	}
+	if viewerID == targetID {
+		return errBadRequest("不能备注自己，请改用群名片")
+	}
+	r := strings.TrimSpace(remark)
+	if len([]rune(r)) > 32 {
+		return errBadRequest("备注最多 32 字")
+	}
+	return s.friend.SetGroupMemberRemark(ctx, viewerID, groupID, targetID, r)
+}
+
+func (s *FriendService) SetMyGroupNickname(ctx context.Context, groupID, userID int64, nickname string) error {
+	ok, err := s.friend.IsGroupMember(ctx, groupID, userID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errBadRequest("您不在该群中")
+	}
+	nick := strings.TrimSpace(nickname)
+	if len([]rune(nick)) > 32 {
+		return errBadRequest("群名片最多 32 字")
+	}
+	return s.friend.SetMemberNickname(ctx, groupID, userID, nick)
+}
+
+func (s *FriendService) SetGroupAdminOnly(ctx context.Context, groupID, operatorID int64, adminOnly bool) error {
+	g, _, err := s.friend.GetGroup(ctx, groupID)
+	if err != nil {
+		return errBadRequest("群不存在")
+	}
+	if g.OwnerID != operatorID {
+		role, rerr := s.friend.GetMemberRole(ctx, groupID, operatorID)
+		if rerr != nil || role < store.GroupRoleAdmin {
+			return errBadRequest("仅群主或管理员可设置全员禁言")
+		}
+	}
+	return s.friend.SetGroupAdminOnly(ctx, groupID, adminOnly)
+}
+
+func (s *FriendService) SetGroupSlowMode(ctx context.Context, groupID, operatorID int64, secs int) error {
+	if secs < 0 || secs > 3600 {
+		return errBadRequest("慢速间隔须在 0–3600 秒")
+	}
+	if err := s.requireGroupManager(ctx, groupID, operatorID); err != nil {
+		return err
+	}
+	return s.friend.SetGroupSlowMode(ctx, groupID, secs)
+}
+
+func (s *FriendService) SetGroupMemberMuted(ctx context.Context, groupID, operatorID, targetID int64, muted bool) error {
+	g, _, err := s.friend.GetGroup(ctx, groupID)
+	if err != nil {
+		return errBadRequest("群不存在")
+	}
+	opRole, err := s.friend.GetMemberRole(ctx, groupID, operatorID)
+	if err != nil {
+		return errBadRequest("您不在该群中")
+	}
+	if opRole < store.GroupRoleAdmin && g.OwnerID != operatorID {
+		return errBadRequest("仅群主或管理员可禁言成员")
+	}
+	if targetID == g.OwnerID {
+		return errBadRequest("不能禁言群主")
+	}
+	targetRole, err := s.friend.GetMemberRole(ctx, groupID, targetID)
+	if err != nil {
+		return errBadRequest("目标用户不在群中")
+	}
+	if opRole == store.GroupRoleAdmin && targetRole >= store.GroupRoleAdmin {
+		return errBadRequest("管理员不能禁言其他管理员")
+	}
+	if operatorID == targetID {
+		return errBadRequest("不能禁言自己")
+	}
+	return s.friend.SetMemberMuted(ctx, groupID, targetID, muted)
 }
 
 func (s *FriendService) SetGroupNotice(ctx context.Context, groupID, operatorID int64, notice string) error {
@@ -544,6 +667,40 @@ func (s *FriendService) SetGroupNotice(ctx context.Context, groupID, operatorID 
 		return errBadRequest("公告不能超过200字")
 	}
 	return s.friend.SetGroupNotice(ctx, groupID, notice)
+}
+
+func (s *FriendService) SetGroupWelcome(ctx context.Context, groupID, operatorID int64, welcome string) error {
+	if err := s.requireGroupManager(ctx, groupID, operatorID); err != nil {
+		return err
+	}
+	welcome = strings.TrimSpace(welcome)
+	if len([]rune(welcome)) > 200 {
+		return errBadRequest("欢迎语不能超过200字")
+	}
+	return s.friend.SetGroupWelcome(ctx, groupID, welcome)
+}
+
+func (s *FriendService) announceMemberJoined(ctx context.Context, groupID, userID int64) {
+	if s.msgs == nil {
+		return
+	}
+	g, _, err := s.friend.GetGroup(ctx, groupID)
+	if err != nil {
+		return
+	}
+	name := strconv.FormatInt(userID, 10)
+	if u, err := s.users.GetByID(ctx, userID); err == nil {
+		pub := u.ApplyPrivacy(false)
+		if pub.Nickname != "" {
+			name = pub.Nickname
+		} else if pub.Username != "" {
+			name = pub.Username
+		}
+	}
+	_ = s.msgs.PostSystemMessage(ctx, g.ConversationID, name+" 加入了群聊")
+	if w := strings.TrimSpace(g.WelcomeText); w != "" {
+		_ = s.msgs.PostSystemMessage(ctx, g.ConversationID, w)
+	}
 }
 
 func (s *FriendService) AddGroupMembers(ctx context.Context, groupID, operatorID int64, userIDs []int64) error {
@@ -717,6 +874,215 @@ func (s *FriendService) ListPending(ctx context.Context, userID int64) ([]map[st
 		})
 	}
 	return out, nil
+}
+
+func randomInviteCode(n int) (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	b := make([]byte, n)
+	max := big.NewInt(int64(len(alphabet)))
+	for i := 0; i < n; i++ {
+		v, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		b[i] = alphabet[v.Int64()]
+	}
+	return string(b), nil
+}
+
+func (s *FriendService) CreateInviteLink(ctx context.Context, groupID, operatorID int64, maxUses, expiresHours int) (map[string]interface{}, error) {
+	if err := s.requireGroupManager(ctx, groupID, operatorID); err != nil {
+		return nil, err
+	}
+	if maxUses < 0 || maxUses > 10000 {
+		return nil, errBadRequest("使用次数无效")
+	}
+	if expiresHours < 0 || expiresHours > 24*90 {
+		return nil, errBadRequest("有效期无效")
+	}
+	var exp *time.Time
+	if expiresHours > 0 {
+		t := time.Now().Add(time.Duration(expiresHours) * time.Hour)
+		exp = &t
+	}
+	var code string
+	var linkID int64
+	for attempt := 0; attempt < 8; attempt++ {
+		c, err := randomInviteCode(8)
+		if err != nil {
+			return nil, err
+		}
+		linkID = s.idgen.Next()
+		link := &store.GroupInviteLink{
+			ID:        linkID,
+			GroupID:   groupID,
+			Code:      c,
+			CreatedBy: operatorID,
+			MaxUses:   maxUses,
+			ExpiresAt: exp,
+		}
+		if err := s.friend.CreateInviteLink(ctx, link); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+				continue
+			}
+			return nil, err
+		}
+		code = c
+		break
+	}
+	if code == "" {
+		return nil, errBadRequest("生成邀请码失败，请重试")
+	}
+	out := map[string]interface{}{
+		"id":        strconv.FormatInt(linkID, 10),
+		"group_id":  strconv.FormatInt(groupID, 10),
+		"code":      code,
+		"max_uses":  maxUses,
+		"use_count": 0,
+		"revoked":   false,
+	}
+	if exp != nil {
+		out["expires_at"] = exp.Format(time.RFC3339)
+	}
+	return out, nil
+}
+
+func (s *FriendService) ListInviteLinks(ctx context.Context, groupID, operatorID int64) ([]map[string]interface{}, error) {
+	if err := s.requireGroupManager(ctx, groupID, operatorID); err != nil {
+		return nil, err
+	}
+	rows, err := s.friend.ListInviteLinks(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, l := range rows {
+		item := map[string]interface{}{
+			"id":         strconv.FormatInt(l.ID, 10),
+			"group_id":   strconv.FormatInt(l.GroupID, 10),
+			"code":       l.Code,
+			"max_uses":   l.MaxUses,
+			"use_count":  l.UseCount,
+			"revoked":    l.Revoked,
+			"created_at": l.CreatedAt.Format(time.RFC3339),
+		}
+		if l.ExpiresAt != nil {
+			item["expires_at"] = l.ExpiresAt.Format(time.RFC3339)
+			item["expired"] = !l.ExpiresAt.After(now)
+		} else {
+			item["expired"] = false
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (s *FriendService) RevokeInviteLink(ctx context.Context, groupID, linkID, operatorID int64) error {
+	if err := s.requireGroupManager(ctx, groupID, operatorID); err != nil {
+		return err
+	}
+	if err := s.friend.RevokeInviteLink(ctx, groupID, linkID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return errBadRequest("邀请链接不存在或已撤销")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *FriendService) PreviewInviteLink(ctx context.Context, code string, userID int64) (map[string]interface{}, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil, errBadRequest("请输入邀请码")
+	}
+	link, err := s.friend.GetInviteLinkByCode(ctx, code)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errBadRequest("邀请链接无效")
+		}
+		return nil, err
+	}
+	g, _, err := s.friend.GetGroup(ctx, link.GroupID)
+	if err != nil {
+		return nil, errBadRequest("群不存在")
+	}
+	count, _ := s.friend.CountGroupMembers(ctx, link.GroupID)
+	member := false
+	if userID > 0 {
+		member, _ = s.friend.IsGroupMember(ctx, link.GroupID, userID)
+	}
+	expired := link.Revoked || (link.ExpiresAt != nil && !link.ExpiresAt.After(time.Now())) ||
+		(link.MaxUses > 0 && link.UseCount >= link.MaxUses)
+	out := map[string]interface{}{
+		"code":         link.Code,
+		"group_id":     strconv.FormatInt(g.ID, 10),
+		"group_name":   g.Name,
+		"group_no":     g.GroupNo,
+		"member_count": count,
+		"is_member":    member,
+		"usable":       !expired,
+	}
+	if link.ExpiresAt != nil {
+		out["expires_at"] = link.ExpiresAt.Format(time.RFC3339)
+	}
+	return out, nil
+}
+
+func (s *FriendService) JoinViaInviteLink(ctx context.Context, code string, userID int64) (map[string]interface{}, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil, errBadRequest("请输入邀请码")
+	}
+	existing, err := s.friend.GetInviteLinkByCode(ctx, code)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errBadRequest("邀请链接无效")
+		}
+		return nil, err
+	}
+	ok, err := s.friend.IsGroupMember(ctx, existing.GroupID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		g, _, _ := s.friend.GetGroup(ctx, existing.GroupID)
+		return map[string]interface{}{
+			"status":          "already_member",
+			"group_id":        strconv.FormatInt(existing.GroupID, 10),
+			"conversation_id": g.ConversationID,
+			"name":            g.Name,
+		}, nil
+	}
+	link, err := s.friend.ConsumeInviteLink(ctx, code)
+	if err != nil {
+		switch err.Error() {
+		case "link revoked":
+			return nil, errBadRequest("邀请链接已撤销")
+		case "link expired":
+			return nil, errBadRequest("邀请链接已过期")
+		case "link exhausted":
+			return nil, errBadRequest("邀请链接已达使用上限")
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errBadRequest("邀请链接无效")
+		}
+		return nil, err
+	}
+	if err := s.friend.AddGroupMember(ctx, link.GroupID, userID); err != nil {
+		return nil, err
+	}
+	s.announceMemberJoined(ctx, link.GroupID, userID)
+	g, _, err := s.friend.GetGroup(ctx, link.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"status":          "joined",
+		"group_id":        strconv.FormatInt(g.ID, 10),
+		"conversation_id": g.ConversationID,
+		"name":            g.Name,
+	}, nil
 }
 
 type errBadRequest string

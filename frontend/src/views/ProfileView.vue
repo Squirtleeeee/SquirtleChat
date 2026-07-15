@@ -103,9 +103,17 @@ async function saveRemark() {
         <UserAvatar :src="profile.avatar" :name="displayName()" :size="80" />
         <h2>{{ displayName() }}</h2>
         <p class="username">@{{ profile.username }}</p>
+        <p v-if="profile.status_text || profile.status_emoji" class="status-line">
+          <span v-if="profile.status_emoji">{{ profile.status_emoji }}</span>
+          {{ profile.status_text }}
+        </p>
       </div>
 
       <dl class="profile-fields">
+        <template v-if="profile.status_text || profile.status_emoji">
+          <dt>状态</dt>
+          <dd>{{ profile.status_emoji }} {{ profile.status_text }}</dd>
+        </template>
         <template v-if="profile.nickname">
           <dt>昵称</dt>
           <dd>{{ profile.nickname }}</dd>
@@ -244,6 +252,12 @@ async function saveRemark() {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--color-text-muted);
+}
+
+.status-line {
+  margin: 6px 0 0;
+  font-size: var(--text-sm);
+  color: var(--color-text);
 }
 
 .profile-fields {

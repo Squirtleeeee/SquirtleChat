@@ -34,6 +34,8 @@ async function refreshAccessToken(): Promise<string> {
 http.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token')
   if (token) config.headers.Authorization = `Bearer ${token}`
+  const deviceId = localStorage.getItem('device_id')
+  if (deviceId) config.headers['X-Device-Id'] = deviceId
   return config
 })
 

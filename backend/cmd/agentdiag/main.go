@@ -31,7 +31,7 @@ func main() {
 	ctx := context.Background()
 	botID, _ := c.Agent.BotUserID(ctx)
 
-	res, err := c.Auth.Login(ctx, "test_a", "test1234", "agentdiag")
+	res, err := c.Auth.Login(ctx, "test_a", "test1234", "agentdiag", "agentdiag")
 	if err != nil {
 		log.Fatal("login:", err)
 	}

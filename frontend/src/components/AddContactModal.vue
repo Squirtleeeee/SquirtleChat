@@ -8,7 +8,7 @@ import type { PublicProfile } from '../stores/auth'
 const emit = defineEmits<{ close: [] }>()
 
 const chat = useChatStore()
-const tab = ref<'friend' | 'group' | 'create' | 'face'>('friend')
+const tab = ref<'friend' | 'group' | 'create' | 'face' | 'link'>('friend')
 const query = ref('')
 const friendResults = ref<PublicProfile[]>([])
 const groupResults = ref<GroupPublicItem[]>([])
@@ -21,6 +21,16 @@ const memberFaceCode = ref('')
 const faceStarting = ref(false)
 const faceJoining = ref(false)
 const loading = ref(false)
+const inviteCodeInput = ref('')
+const invitePreview = ref<{
+  code: string
+  group_name: string
+  group_no: string
+  member_count: number
+  is_member?: boolean
+  usable?: boolean
+} | null>(null)
+const linkJoining = ref(false)
 
 const selectableFriends = computed(() =>
   chat.friends.filter((f) => f.username !== 'squirtle_ai'),
@@ -82,6 +92,41 @@ async function requestJoinGroup(g: GroupPublicItem) {
     await chat.joinGroupByNo(g.group_no)
   } catch (e) {
     chat.setError(parseError(e))
+  }
+}
+
+function extractInviteCode(raw: string) {
+  const t = raw.trim()
+  const m = t.match(/([A-Za-z0-9]{8})\s*$/)
+  return m?.[1] || t
+}
+
+async function previewInvite() {
+  const code = extractInviteCode(inviteCodeInput.value)
+  if (!code) return
+  loading.value = true
+  invitePreview.value = null
+  try {
+    invitePreview.value = await chat.previewInviteLink(code)
+    inviteCodeInput.value = invitePreview.value.code
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    loading.value = false
+  }
+}
+
+async function joinInvite() {
+  const code = invitePreview.value?.code || extractInviteCode(inviteCodeInput.value)
+  if (!code) return
+  linkJoining.value = true
+  try {
+    await chat.joinViaInviteLink(code)
+    emit('close')
+  } catch (e) {
+    chat.setError(parseError(e))
+  } finally {
+    linkJoining.value = false
   }
 }
 
@@ -160,6 +205,7 @@ function displayName(u: PublicProfile) {
       <div class="modal-tabs">
         <button type="button" class="modal-tab" :class="{ active: tab === 'friend' }" @click="tab = 'friend'">搜索好友</button>
         <button type="button" class="modal-tab" :class="{ active: tab === 'group' }" @click="tab = 'group'">搜索群聊</button>
+        <button type="button" class="modal-tab" :class="{ active: tab === 'link' }" @click="tab = 'link'">邀请码</button>
         <button type="button" class="modal-tab" :class="{ active: tab === 'create' }" @click="tab = 'create'">创建群聊</button>
         <button type="button" class="modal-tab" :class="{ active: tab === 'face' }" @click="tab = 'face'">面对面建群</button>
       </div>
@@ -228,6 +274,47 @@ function displayName(u: PublicProfile) {
             @click="requestJoinGroup(selectedGroup)"
           >
             申请加入
+          </button>
+        </div>
+      </div>
+
+      <div v-else-if="tab === 'link'" class="modal-body">
+        <p class="field-hint">粘贴群邀请码（8 位），预览后直接加入</p>
+        <div class="search-row">
+          <input
+            v-model="inviteCodeInput"
+            class="input"
+            type="text"
+            maxlength="64"
+            placeholder="邀请码"
+            @keyup.enter="previewInvite"
+          />
+          <button type="button" class="btn btn-primary btn-sm" :disabled="loading" @click="previewInvite">
+            预览
+          </button>
+        </div>
+        <div v-if="invitePreview" class="group-preview">
+          <h4>{{ invitePreview.group_name }}</h4>
+          <p class="preview-meta">
+            群号 {{ invitePreview.group_no }} · {{ invitePreview.member_count }} 位成员
+            <template v-if="invitePreview.usable === false"> · 链接不可用</template>
+          </p>
+          <button
+            v-if="invitePreview.is_member"
+            type="button"
+            class="btn btn-secondary btn-block"
+            disabled
+          >
+            您已在该群中
+          </button>
+          <button
+            v-else
+            type="button"
+            class="btn btn-primary btn-block"
+            :disabled="linkJoining || invitePreview.usable === false"
+            @click="joinInvite"
+          >
+            {{ linkJoining ? '加入中…' : '加入群聊' }}
           </button>
         </div>
       </div>

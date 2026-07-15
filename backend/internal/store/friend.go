@@ -236,12 +236,16 @@ func (s *FriendStore) ListGroupMemberIDs(ctx context.Context, groupID int64) ([]
 }
 
 type GroupMemberRole struct {
-	UserID int64
-	Role   int
+	UserID   int64
+	Role     int
+	Muted    bool
+	Nickname string
 }
 
 func (s *FriendStore) ListGroupMemberRoles(ctx context.Context, groupID int64) ([]GroupMemberRole, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT user_id, role FROM group_members WHERE group_id = ? ORDER BY role DESC, user_id`, groupID)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT user_id, role, COALESCE(muted, 0), COALESCE(nickname, '')
+		FROM group_members WHERE group_id = ? ORDER BY role DESC, user_id`, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -249,9 +253,11 @@ func (s *FriendStore) ListGroupMemberRoles(ctx context.Context, groupID int64) (
 	var list []GroupMemberRole
 	for rows.Next() {
 		var r GroupMemberRole
-		if err := rows.Scan(&r.UserID, &r.Role); err != nil {
+		var muted int
+		if err := rows.Scan(&r.UserID, &r.Role, &muted, &r.Nickname); err != nil {
 			return nil, err
 		}
+		r.Muted = muted == 1
 		list = append(list, r)
 	}
 	return list, rows.Err()
@@ -294,6 +300,9 @@ type GroupSummary struct {
 	OwnerID        int64  `json:"owner_id,string"`
 	ConversationID string `json:"conversation_id"`
 	Notice         string `json:"notice"`
+	WelcomeText    string `json:"welcome_text"`
+	AdminOnly      bool   `json:"admin_only"`
+	SlowModeSecs   int    `json:"slow_mode_secs"`
 }
 
 type GroupPublicSummary struct {
@@ -324,7 +333,8 @@ type FaceSession struct {
 
 func (s *FriendStore) ListUserGroups(ctx context.Context, userID int64) ([]GroupSummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT g.id, g.name, g.group_no, g.owner_id, g.notice FROM ` + "`groups`" + ` g
+		SELECT g.id, g.name, g.group_no, g.owner_id, g.notice, COALESCE(g.welcome_text, ''), COALESCE(g.admin_only, 0), COALESCE(g.slow_mode_secs, 0)
+		FROM `+"`groups`"+` g
 		INNER JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = ?`, userID)
 	if err != nil {
 		return nil, err
@@ -333,9 +343,11 @@ func (s *FriendStore) ListUserGroups(ctx context.Context, userID int64) ([]Group
 	var list []GroupSummary
 	for rows.Next() {
 		var g GroupSummary
-		if err := rows.Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice); err != nil {
+		var adminOnly int
+		if err := rows.Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice, &g.WelcomeText, &adminOnly, &g.SlowModeSecs); err != nil {
 			return nil, err
 		}
+		g.AdminOnly = adminOnly == 1
 		g.ConversationID = "g_" + idformat(g.ID)
 		list = append(list, g)
 	}
@@ -348,7 +360,8 @@ func (s *FriendStore) SearchGroups(ctx context.Context, userID int64, q string, 
 	}
 	like := "%" + q + "%"
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT g.id, g.name, g.group_no, g.owner_id, g.notice FROM `+`groups`+` g
+		SELECT g.id, g.name, g.group_no, g.owner_id, g.notice, COALESCE(g.welcome_text, ''), COALESCE(g.admin_only, 0), COALESCE(g.slow_mode_secs, 0)
+		FROM `+"`groups`"+` g
 		INNER JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = ?
 		WHERE g.name LIKE ? OR g.group_no LIKE ? LIMIT ?`, userID, like, like, limit)
 	if err != nil {
@@ -358,9 +371,11 @@ func (s *FriendStore) SearchGroups(ctx context.Context, userID int64, q string, 
 	var list []GroupSummary
 	for rows.Next() {
 		var g GroupSummary
-		if err := rows.Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice); err != nil {
+		var adminOnly int
+		if err := rows.Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice, &g.WelcomeText, &adminOnly, &g.SlowModeSecs); err != nil {
 			return nil, err
 		}
+		g.AdminOnly = adminOnly == 1
 		g.ConversationID = "g_" + idformat(g.ID)
 		list = append(list, g)
 	}
@@ -369,14 +384,18 @@ func (s *FriendStore) SearchGroups(ctx context.Context, userID int64, q string, 
 
 func (s *FriendStore) GetGroup(ctx context.Context, groupID int64) (*GroupSummary, []int64, error) {
 	var g GroupSummary
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, group_no, owner_id, notice FROM `+"`groups`"+` WHERE id = ?`, groupID).
-		Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice)
+	var adminOnly int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, group_no, owner_id, notice, COALESCE(welcome_text, ''), COALESCE(admin_only, 0), COALESCE(slow_mode_secs, 0)
+		FROM `+"`groups`"+` WHERE id = ?`, groupID).
+		Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice, &g.WelcomeText, &adminOnly, &g.SlowModeSecs)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, ErrNotFound
 		}
 		return nil, nil, err
 	}
+	g.AdminOnly = adminOnly == 1
 	g.ConversationID = "g_" + idformat(g.ID)
 	if g.GroupNo == "" {
 		if no, err := s.EnsureGroupNo(ctx, groupID); err == nil {
@@ -419,6 +438,65 @@ func (s *FriendStore) SetGroupNotice(ctx context.Context, groupID int64, notice 
 	return err
 }
 
+func (s *FriendStore) SetGroupWelcome(ctx context.Context, groupID int64, welcome string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE `+"`groups`"+` SET welcome_text = ? WHERE id = ?`, welcome, groupID)
+	return err
+}
+
+func (s *FriendStore) SetGroupAdminOnly(ctx context.Context, groupID int64, adminOnly bool) error {
+	v := 0
+	if adminOnly {
+		v = 1
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE `+"`groups`"+` SET admin_only = ? WHERE id = ?`, v, groupID)
+	return err
+}
+
+func (s *FriendStore) SetGroupSlowMode(ctx context.Context, groupID int64, secs int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE `+"`groups`"+` SET slow_mode_secs = ? WHERE id = ?`, secs, groupID)
+	return err
+}
+
+func (s *FriendStore) SetMemberMuted(ctx context.Context, groupID, userID int64, muted bool) error {
+	v := 0
+	if muted {
+		v = 1
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE group_members SET muted = ? WHERE group_id = ? AND user_id = ?`, v, groupID, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *FriendStore) SetMemberNickname(ctx context.Context, groupID, userID int64, nickname string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE group_members SET nickname = ? WHERE group_id = ? AND user_id = ?`, nickname, groupID, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *FriendStore) IsMemberMuted(ctx context.Context, groupID, userID int64) (bool, error) {
+	var muted int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(muted, 0) FROM group_members WHERE group_id = ? AND user_id = ?`, groupID, userID).Scan(&muted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return muted == 1, err
+}
+
 func (s *FriendStore) IsGroupMember(ctx context.Context, groupID, userID int64) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM group_members WHERE group_id = ? AND user_id = ?`, groupID, userID).Scan(&n)
@@ -442,14 +520,18 @@ func (s *FriendStore) CountGroupMembers(ctx context.Context, groupID int64) (int
 
 func (s *FriendStore) GetGroupByNo(ctx context.Context, groupNo string) (*GroupSummary, error) {
 	var g GroupSummary
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, group_no, owner_id, notice FROM `+"`groups`"+` WHERE group_no = ?`, groupNo).
-		Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice)
+	var adminOnly int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, group_no, owner_id, notice, COALESCE(welcome_text, ''), COALESCE(admin_only, 0), COALESCE(slow_mode_secs, 0)
+		FROM `+"`groups`"+` WHERE group_no = ?`, groupNo).
+		Scan(&g.ID, &g.Name, &g.GroupNo, &g.OwnerID, &g.Notice, &g.WelcomeText, &adminOnly, &g.SlowModeSecs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	g.AdminOnly = adminOnly == 1
 	g.ConversationID = "g_" + idformat(g.ID)
 	return &g, nil
 }
@@ -575,10 +657,10 @@ func (s *FriendStore) ListPendingGroupInvites(ctx context.Context, toUserID int6
 	return list, rows.Err()
 }
 
-func (s *FriendStore) AcceptGroupInvitation(ctx context.Context, inviteID, userID int64) error {
+func (s *FriendStore) AcceptGroupInvitation(ctx context.Context, inviteID, userID int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	var inv GroupInvitation
@@ -588,21 +670,24 @@ func (s *FriendStore) AcceptGroupInvitation(ctx context.Context, inviteID, userI
 		inviteID, userID).Scan(&inv.ID, &inv.GroupID, &inv.FromUserID, &inv.ToUserID, &inv.Message, &inv.InviteType, &inv.Status)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			return 0, ErrNotFound
 		}
-		return err
+		return 0, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE group_invitations SET status = ? WHERE id = ?`, GroupInviteStatusAccepted, inviteID); err != nil {
-		return err
+		return 0, err
 	}
 	convID := "g_" + idformat(inv.GroupID)
 	if _, err = tx.ExecContext(ctx, `INSERT IGNORE INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)`, inv.GroupID, userID, GroupRoleMember); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT IGNORE INTO conversation_members (conversation_id, user_id) VALUES (?, ?)`, convID, userID); err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return inv.GroupID, nil
 }
 
 func (s *FriendStore) RejectGroupInvitation(ctx context.Context, inviteID, userID int64) error {
@@ -838,4 +923,164 @@ func idformat(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+type GroupInviteLink struct {
+	ID        int64
+	GroupID   int64
+	Code      string
+	CreatedBy int64
+	MaxUses   int
+	UseCount  int
+	ExpiresAt *time.Time
+	Revoked   bool
+	CreatedAt time.Time
+}
+
+func (s *FriendStore) CreateInviteLink(ctx context.Context, link *GroupInviteLink) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO group_invite_links (id, group_id, code, created_by, max_uses, use_count, expires_at, revoked)
+		VALUES (?, ?, ?, ?, ?, 0, ?, 0)`,
+		link.ID, link.GroupID, link.Code, link.CreatedBy, link.MaxUses, link.ExpiresAt)
+	return err
+}
+
+func (s *FriendStore) ListInviteLinks(ctx context.Context, groupID int64) ([]GroupInviteLink, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, group_id, code, created_by, max_uses, use_count, expires_at, revoked, created_at
+		FROM group_invite_links WHERE group_id = ? AND revoked = 0 ORDER BY id DESC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []GroupInviteLink
+	for rows.Next() {
+		var l GroupInviteLink
+		var revoked int
+		var exp sql.NullTime
+		if err := rows.Scan(&l.ID, &l.GroupID, &l.Code, &l.CreatedBy, &l.MaxUses, &l.UseCount, &exp, &revoked, &l.CreatedAt); err != nil {
+			return nil, err
+		}
+		l.Revoked = revoked == 1
+		if exp.Valid {
+			t := exp.Time
+			l.ExpiresAt = &t
+		}
+		list = append(list, l)
+	}
+	return list, rows.Err()
+}
+
+func (s *FriendStore) GetInviteLinkByCode(ctx context.Context, code string) (*GroupInviteLink, error) {
+	var l GroupInviteLink
+	var revoked int
+	var exp sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, group_id, code, created_by, max_uses, use_count, expires_at, revoked, created_at
+		FROM group_invite_links WHERE code = ?`, code).Scan(
+		&l.ID, &l.GroupID, &l.Code, &l.CreatedBy, &l.MaxUses, &l.UseCount, &exp, &revoked, &l.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	l.Revoked = revoked == 1
+	if exp.Valid {
+		t := exp.Time
+		l.ExpiresAt = &t
+	}
+	return &l, nil
+}
+
+func (s *FriendStore) RevokeInviteLink(ctx context.Context, groupID, linkID int64) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE group_invite_links SET revoked = 1 WHERE id = ? AND group_id = ? AND revoked = 0`, linkID, groupID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ConsumeInviteLink atomically increments use_count when the link is still valid.
+func (s *FriendStore) ConsumeInviteLink(ctx context.Context, code string) (*GroupInviteLink, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var l GroupInviteLink
+	var revoked int
+	var exp sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, group_id, code, created_by, max_uses, use_count, expires_at, revoked, created_at
+		FROM group_invite_links WHERE code = ? FOR UPDATE`, code).Scan(
+		&l.ID, &l.GroupID, &l.Code, &l.CreatedBy, &l.MaxUses, &l.UseCount, &exp, &revoked, &l.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	l.Revoked = revoked == 1
+	if exp.Valid {
+		t := exp.Time
+		l.ExpiresAt = &t
+	}
+	if l.Revoked {
+		return nil, errors.New("link revoked")
+	}
+	if l.ExpiresAt != nil && !l.ExpiresAt.After(time.Now()) {
+		return nil, errors.New("link expired")
+	}
+	if l.MaxUses > 0 && l.UseCount >= l.MaxUses {
+		return nil, errors.New("link exhausted")
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE group_invite_links SET use_count = use_count + 1 WHERE id = ?`, l.ID); err != nil {
+		return nil, err
+	}
+	l.UseCount++
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
+func (s *FriendStore) SetGroupMemberRemark(ctx context.Context, viewerID, groupID, targetID int64, remark string) error {
+	if remark == "" {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM group_member_remarks WHERE user_id = ? AND group_id = ? AND target_user_id = ?`,
+			viewerID, groupID, targetID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO group_member_remarks (user_id, group_id, target_user_id, remark)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE remark = VALUES(remark)`,
+		viewerID, groupID, targetID, remark)
+	return err
+}
+
+func (s *FriendStore) ListGroupMemberRemarks(ctx context.Context, viewerID, groupID int64) (map[int64]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT target_user_id, remark FROM group_member_remarks
+		WHERE user_id = ? AND group_id = ? AND remark <> ''`, viewerID, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]string{}
+	for rows.Next() {
+		var tid int64
+		var remark string
+		if err := rows.Scan(&tid, &remark); err != nil {
+			return nil, err
+		}
+		out[tid] = remark
+	}
+	return out, rows.Err()
 }
